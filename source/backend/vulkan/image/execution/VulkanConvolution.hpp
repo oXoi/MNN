@@ -64,7 +64,7 @@ public:
     private:
         const VulkanBackend* mBackend;
         const VulkanPipeline* mPipeline;
-        std::shared_ptr<VulkanPipeline::DescriptorSet> mSets;
+        std::shared_ptr<VulkanLayout::DescriptorSet> mSets;
         std::shared_ptr<VulkanBuffer> mConstBuffer;
     };
     static int gImage2ColLocal;
@@ -92,16 +92,18 @@ private:
     bool _init(const float* weightData, size_t weightSize, const Op* op, Backend* bn);
     std::shared_ptr<VulkanImage> mKernel;
 
-    const VulkanPipeline* mConvPipeline;
+    SharedPtr<VulkanPipeline> mConvPipeline;
 
-    std::shared_ptr<VulkanPipeline::DescriptorSet> mConvSet;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mConvSet;
     const VulkanSampler* mSampler;
     std::shared_ptr<VulkanImage> mBias;
-    std::vector<std::shared_ptr<VulkanPipeline::DescriptorSet>> mExtraSets;
+    std::vector<std::shared_ptr<VulkanLayout::DescriptorSet>> mExtraSets;
     std::vector<std::shared_ptr<VulkanBuffer>> mExtraBuffers;
 
-    int mLocalX = 0;
-    int mLocalY = 0;
+    bool mUseS1D1W2 = false;
+
+    std::vector<uint32_t> mGws;
+    std::vector<uint32_t> mLws;
 };
 } // namespace MNN
 

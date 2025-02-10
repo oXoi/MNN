@@ -14,6 +14,7 @@
 #include <map>
 #include "Command.hpp"
 #include "NonCopyable.hpp"
+#include "BufferAllocator.hpp"
 #include <future>
 #include <atomic>
 
@@ -24,6 +25,39 @@ class Execution;
 
 class Runtime;
 class Backend;
+struct RuntimeHint {
+    // 0: Defer, 1: Eager
+    int memoryAllocatorType = 0;
+    int winogradMemoryUsed = 3;
+
+    // 0-100, 50 means litter core has 50% capacity of large core
+    int cpuDecreaseRate = 50;
+    int dynamicQuantOption = 0;
+
+    // 0: Do not quantize
+    // 1: Only quantize key, use int8 asymmetric quantization
+    // 2: Only quantize value, use fp8 quantization
+    // 3: quantize both key and value
+    // 4: quantize query, key and value, and use gemm int8 kernel to compute K*V
+    int qkvQuantOption = 0;
+
+    // the kvcache size limit of each layer
+    // if the size of kvcache in memory exceeds the limit
+    // it will be moved to disk to save memory
+    // -1 for no limit
+    int kvcacheSizeLimit = -1;
+
+    // path of the kvcache directory
+    std::string kvcacheDirPath = "/tmp";
+
+    std::string midMemoryPath;
+    std::string weightMemoryPath;
+    int mmapFileSize = 1024; // MB
+    int useCachedMmap = 0;
+
+    // op encoder number for once commit
+    int encorderNumForCommit = 10;
+};
 /** abstract backend */
 class Backend : public NonCopyable {
 
@@ -71,7 +105,9 @@ public:
          - do NOTHING when `onReleaseBuffer` is called.
          - releases memory when `onClearBuffer` is called or when the backend is deleted.
          */
-        DYNAMIC_SEPERATE
+        DYNAMIC_SEPERATE,
+        
+        DYNAMIC_IN_EXECUTION
     };
 
 public:
@@ -109,9 +145,7 @@ public:
     /**
      * @brief callback after resize ops.
      */
-    virtual void onResizeEnd() {
-        // nothing to do
-    }
+    virtual ErrorCode onResizeEnd() = 0;
 
     /**
      * @brief callback before executing ops.
@@ -125,8 +159,7 @@ public:
     virtual const Runtime* getRuntime() {
         return nullptr;
     }
-    const std::string externalFile();
-public:
+
     /**
      * @brief allocate buffer of tensor for given storage type.
      * @param tensor        buffer provider.
@@ -143,10 +176,11 @@ public:
      */
     MNN_PUBLIC bool onReleaseBuffer(const Tensor* tensor, StorageType storageType);
 
-    class MemObj {
+    class MemObj : public RefCount {
     public:
         MemObj() {}
         virtual ~ MemObj() {}
+        virtual MemChunk chunk() { return MemChunk(); }
     };
     /**
      * @brief allocate buffer of tensor for given storage type.
@@ -155,6 +189,18 @@ public:
      * @return MemObj for release, if failed, return nullptr.
      */
     virtual MemObj* onAcquire(const Tensor* tensor, StorageType storageType) = 0;
+
+    virtual bool onSelectDynamicAllocator(int index, int maxIndex) {
+        return false;
+    }
+    /**
+     * @brief get buffer from tensor directly
+     * @param tensor        buffer provider.
+     * @return support or not
+     */
+    virtual bool onGetTensorInfo(const Tensor* tensor, void* dstInfo) {
+        return false;
+    }
 
     /**
      * @brief clear all dynamic buffers.
@@ -212,12 +258,15 @@ public:
         Compiler_Loop = 2,
     };
 
-    void setExternalFile(std::string file) {
-        mExternalFile = file;
+    enum AllocatorType {
+        Allocator_Defer = 0,
+        Allocator_Eager = 1,
+    };
+    void setRuntimeHint(const RuntimeHint& hint) {
+        mHint = hint;
     }
-
-    std::string getExternalFile() const {
-        return mExternalFile;
+    const RuntimeHint& hint() const {
+        return mHint;
     }
 
     virtual CompilerType onGetCompilerType() const {
@@ -229,7 +278,14 @@ public:
      @brief create backend
      @return created backend
      */
-    virtual Backend* onCreate(const BackendConfig* config = nullptr) const = 0;
+    virtual Backend* onCreate(const BackendConfig* config = nullptr, Backend* origin = nullptr) const = 0;
+
+    /**
+     @brief reset runtime
+     */
+    virtual void onReset(int numberThread, const BackendConfig* config, bool full) {
+        // Do nothing
+    }
 
     /**
      @brief clear unuseful resource
@@ -255,6 +311,10 @@ public:
     }
     virtual int onGetRuntimeStatus(RuntimeStatus statusEnum) const {
         return 0;
+    }
+    // If the info user set can't be match by runtime, return false and set real info
+    virtual bool onCheckInfo(Backend::Info& info) const {
+        return true;
     }
     struct OpInfo {
         bool initCostLong;
@@ -284,9 +344,14 @@ public:
     MNN_PUBLIC bool hasAsyncWork() const;
     void setAsyncWork(std::future<int>&& future);
     MNN_PUBLIC void waitAsyncWork();
+
+    mutable int pCurrentStatus = 0; // NO_ERROR
+
+    // TODO: Move to Backend
+    void* pMeta;
 private:
     std::future<int> mFuture;
-    std::string mExternalFile;
+    RuntimeHint mHint;
 };
 
 /** abstract Runtime register */

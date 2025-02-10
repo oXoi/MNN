@@ -10,29 +10,23 @@
 #define VulkanMatMul_hpp
 
 #include "VulkanRaster.hpp"
+#include "VulkanLoop.hpp"
 namespace MNN {
 
 class VulkanMatMul : public VulkanBasicExecution {
 public:
     VulkanMatMul(bool transposeA, bool transposeB, Backend* vkBn, bool hasBias);
-    ~ VulkanMatMul() {
-        // Do nothing
-    }
+    ~ VulkanMatMul();
     virtual ErrorCode onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
                                const VulkanCommandPool::Buffer *cmdBuffer) override;
 
 private:
-    VulkanRaster::Componet mInput;
-    VulkanRaster::Componet mKernel;
-    VulkanRaster::Componet mOutput;
-
-    const VulkanPipeline* mBlitPipeline;
-    const VulkanPipeline* mComputePipeline;
-    std::shared_ptr<VulkanPipeline::DescriptorSet> mComputeSet;
-    const VulkanPipeline* mOutputPipeline;
-    std::vector<std::shared_ptr<VulkanBuffer>> mTempBuffer;
+    const VulkanPipeline* mPipeline;
+    std::shared_ptr<VulkanBuffer> mParam;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mDescribe;
     bool mTransposeA;
     bool mTransposeB;
+    bool mHasBias;
 };
 }
 #endif

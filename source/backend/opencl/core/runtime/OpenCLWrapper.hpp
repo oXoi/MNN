@@ -9,7 +9,7 @@
 #ifndef OpenCLWrapper_hpp
 #define OpenCLWrapper_hpp
 
-#if defined(WIN32)
+#if defined(_WIN32)
 #include <Windows.h>
 #undef min
 #undef max
@@ -17,7 +17,6 @@
 #endif
 #include <memory>
 #include "core/Macro.h"
-#define CL_TARGET_OPENCL_VERSION 200
 #define CL_HPP_TARGET_OPENCL_VERSION 110
 #define CL_HPP_MINIMUM_OPENCL_VERSION 110
 
@@ -29,6 +28,12 @@
 #pragma GCC diagnostic pop
 #else
 #include "CL/cl2.hpp"
+#endif
+
+#include "CL/cl_ext_qcom.h"
+#include "CL/cl_ext.h"
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
 #endif
 
 #define MNN_CHECK_NOTNULL(X) MNN_ASSERT(X != NULL)
@@ -51,6 +56,8 @@ public:
     bool isError();
     bool isSvmError();
     bool isPropError();
+    bool isQcomError();
+    bool getFuncAddress(cl_platform_id platform, const char *func_name);
     
     using clGetPlatformIDsFunc        = cl_int (CL_API_CALL *)(cl_uint, cl_platform_id *, cl_uint *);
     using clGetPlatformInfoFunc       = cl_int (CL_API_CALL *)(cl_platform_id, cl_platform_info, size_t, void *, size_t *);
@@ -124,6 +131,7 @@ public:
     using clCreateKernelFunc            = cl_kernel (CL_API_CALL *)(cl_program, const char *, cl_int *);
     using clRetainKernelFunc            = cl_int (CL_API_CALL *)(cl_kernel kernel);
     using clCreateBufferFunc            = cl_mem (CL_API_CALL *)(cl_context, cl_mem_flags, size_t, void *, cl_int *);
+    using clCreateImageFunc             = cl_mem(CL_API_CALL *)(cl_context, cl_mem_flags, const cl_image_format *, const cl_image_desc *, void *, cl_int *);
     using clCreateImage2DFunc           = cl_mem(CL_API_CALL *)(cl_context, // NOLINT
                                                       cl_mem_flags, const cl_image_format *, size_t, size_t, size_t,
                                                       void *, cl_int *);
@@ -144,18 +152,34 @@ public:
                                                    size_t param_value_size, void *param_value,
                                                    size_t *param_value_size_ret);
     using clGetImageInfoFunc           = cl_int (CL_API_CALL *)(cl_mem, cl_image_info, size_t, void *, size_t *);
+    using clReleaseDeviceFunc = cl_int (CL_API_CALL *)(cl_device_id);
+    using clRetainDeviceFunc = cl_int (CL_API_CALL *)(cl_device_id);
 
     // opencl 2.0 get sub group info and wave size.
-    using clCreateCommandQueueWithPropertiesFunc = cl_command_queue (*)(cl_context, cl_device_id,
+    using clCreateCommandQueueWithPropertiesFunc = cl_command_queue (CL_API_CALL *)(cl_context, cl_device_id,
                                                     const cl_queue_properties *, cl_int *);
-    using clSVMAllocFunc = void *(*)(cl_context, cl_mem_flags, size_t size, cl_uint);
-    using clSVMFreeFunc = void (*)(cl_context, void *);
-    using clEnqueueSVMMapFunc = cl_int (*)(cl_command_queue, cl_bool, cl_map_flags,
+    using clSVMAllocFunc = void *(CL_API_CALL *)(cl_context, cl_mem_flags, size_t size, cl_uint);
+    using clSVMFreeFunc = void (CL_API_CALL *)(cl_context, void *);
+    using clEnqueueSVMMapFunc = cl_int (CL_API_CALL *)(cl_command_queue, cl_bool, cl_map_flags,
                                            void *, size_t, cl_uint, const cl_event *, cl_event *);
-    using clEnqueueSVMUnmapFunc = cl_int (*)(cl_command_queue, void *, cl_uint,
+    using clEnqueueSVMUnmapFunc = cl_int (CL_API_CALL *)(cl_command_queue, void *, cl_uint,
                                              const cl_event *, cl_event *);
-    using clSetKernelArgSVMPointerFunc = cl_int (*)(cl_kernel, cl_uint, const void *);
-
+    using clSetKernelArgSVMPointerFunc = cl_int (CL_API_CALL *)(cl_kernel, cl_uint, const void *);
+    
+    using clNewRecordingQCOMFunc = cl_recording_qcom(CL_API_CALL *)(cl_command_queue, cl_int *);
+    using clEndRecordingQCOMFunc = cl_int (CL_API_CALL *)(cl_recording_qcom);
+    using clReleaseRecordingQCOMFunc = cl_int (CL_API_CALL *)(cl_recording_qcom);
+    using clRetainRecordingQCOMFunc = cl_int (CL_API_CALL *)(cl_recording_qcom);
+    using clEnqueueRecordingQCOMFunc = cl_int (CL_API_CALL *)(cl_command_queue, cl_recording_qcom, size_t, const cl_array_arg_qcom*, size_t, const cl_offset_qcom*,
+                                                  size_t, const cl_workgroup_qcom*, size_t, const cl_workgroup_qcom*, cl_uint, const cl_event*, cl_event*);
+    using clEnqueueRecordingSVMQCOMFunc = cl_int (CL_API_CALL *)(cl_command_queue, cl_recording_qcom, size_t, const cl_array_arg_qcom*, size_t, const cl_array_arg_qcom*,
+                                                     size_t, const cl_offset_qcom*, size_t, const cl_workgroup_qcom*, size_t, const cl_workgroup_qcom*,
+                                                     size_t, const cl_array_kernel_exec_info_qcom*, cl_uint, const cl_event*, cl_event*);
+    
+    using clGetExtensionFunctionAddressFunc = void *(CL_API_CALL *)(const char *);
+    using clGetExtensionFunctionAddressForPlatformFunc = void *(CL_API_CALL *)(cl_platform_id, const char *);
+    using clImportMemoryARMFunc = cl_mem (CL_API_CALL *)(cl_context, cl_mem_flags, const cl_import_properties_arm*, void*, size_t, cl_int*);
+    
 #define MNN_CL_DEFINE_FUNC_PTR(func) func##Func func = nullptr
 
     MNN_CL_DEFINE_FUNC_PTR(clGetPlatformIDs);
@@ -212,12 +236,22 @@ public:
     MNN_CL_DEFINE_FUNC_PTR(clEnqueueSVMMap);
     MNN_CL_DEFINE_FUNC_PTR(clEnqueueSVMUnmap);
     MNN_CL_DEFINE_FUNC_PTR(clSetKernelArgSVMPointer);
+    
+    MNN_CL_DEFINE_FUNC_PTR(clNewRecordingQCOM);
+    MNN_CL_DEFINE_FUNC_PTR(clEndRecordingQCOM);
+    MNN_CL_DEFINE_FUNC_PTR(clReleaseRecordingQCOM);
+    MNN_CL_DEFINE_FUNC_PTR(clRetainRecordingQCOM);
+    MNN_CL_DEFINE_FUNC_PTR(clEnqueueRecordingQCOM);
+    MNN_CL_DEFINE_FUNC_PTR(clEnqueueRecordingSVMQCOM);
+    MNN_CL_DEFINE_FUNC_PTR(clGetExtensionFunctionAddress);
+    MNN_CL_DEFINE_FUNC_PTR(clGetExtensionFunctionAddressForPlatform);
+    MNN_CL_DEFINE_FUNC_PTR(clImportMemoryARM);
 
 #undef MNN_CL_DEFINE_FUNC_PTR
 
 private:
     bool LoadLibraryFromPath(const std::string &path);
-#if defined(WIN32)
+#if defined(_WIN32)
     HMODULE handle_ = nullptr;
 #else
     void *handle_ = nullptr;
@@ -225,6 +259,8 @@ private:
     bool mIsError{false};
     bool mSvmError{false};
     bool mPropError{false};
+    bool mQcomError{false};
+    bool mCL_12Error{false};
 };
 
 class OpenCLSymbolsOperator {

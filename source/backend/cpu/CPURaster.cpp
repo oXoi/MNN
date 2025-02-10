@@ -10,7 +10,6 @@
 #include "compute/CommonOptFunction.h"
 #include "CPUTensorConvert.hpp"
 #include "math/Vec.hpp"
-#include "core/OpCommonUtils.hpp"
 #include "core/Concurrency.h"
 #include "compute/ConvOpt.h"
 #include "CPUMatMul.hpp"
@@ -21,168 +20,32 @@
 
 using Vec4 = MNN::Math::Vec<float, 4>;
 namespace MNN {
-
-static void getBatchChannelArea(const Tensor* t, int& batch, int& channel, int& area) {
-    batch = t->batch();
-    if (t->dimensions() == 4) {
-        channel = t->channel();
-        area = t->width() * t->height();
-    } else if (t->dimensions() == 3) {
-        auto format = TensorUtils::getDescribe(t)->dimensionFormat;
-        if (format == MNN_DATA_FORMAT_NHWC) {
-            channel = t->length(2);
-            area    = t->length(1);
-        } else {
-            channel = t->length(1);
-            area    = t->length(2);
-        }
-    } else if (t->dimensions() == 5) {
-        auto format = TensorUtils::getDescribe(t)->dimensionFormat;
-        if (format == MNN_DATA_FORMAT_NHWC) {
-            channel = t->length(4);
-            area    = t->length(1) * t->length(2) * t->length(3);
-        } else {
-            channel = t->length(1);
-            area    = t->length(2) * t->length(3) * t->length(4);
-        }
-    } else {
-        auto format = TensorUtils::getDescribe(t)->dimensionFormat;
-        if (format == MNN_DATA_FORMAT_NHWC) {
-            for (int i = t->dimensions() - 1; i > 0; i--) {
-                int len = t->length(i);
-                if (len > 1) {
-                    if (channel == 1) {
-                        channel = len;
-                    } else {
-                        area *= len;
-                    }
-                }
-            }
-        } else {
-            for (int i = 1; i < t->dimensions(); i++) {
-                int len = t->length(i);
-                if (len > 1) {
-                    if (channel == 1) {
-                        channel = len;
-                    } else {
-                        area *= len;
-                    }
-                }
-            }
-        }
-    }
-}
-// Detect if the region is a transpose
-static bool _transpose(const Tensor::InsideDescribe::Region& region) {
-    int srcOne = -1, dstOne = -1;
-    for (int i = 0; i < 3; i++) {
-        if (region.src.stride[i] == 1 && region.size[i] != 1) {
-            if (srcOne >= 0 || region.size[i] < 4) {
-                return false;
-            }
-            srcOne = i;
-        }
-        if (region.dst.stride[i] == 1 && region.size[i] != 1) {
-            if (dstOne >= 0 || region.size[i] < 4) {
-                return false;
-            }
-            dstOne = i;
-        }
-    }
-    return srcOne >= 0 && dstOne >= 0 && srcOne != dstOne;
-}
-
-static int _singleConvert(const Tensor::InsideDescribe::Region& region, const Tensor* dest) {
-    auto origin = region.origin;
-    auto srcFormat = TensorUtils::getDescribe(origin)->dimensionFormat;
-    auto dstFormat = TensorUtils::getDescribe(dest)->dimensionFormat;
-    if (srcFormat == dstFormat) {
-        return 0;
-    }
-    if (0 != region.src.offset || 0 != region.dst.offset) {
-        return 0;
-    }
-    int dstBatch = 1, dstChannel = 1, dstArea = 1,
-        srcBatch = 1, srcChannel = 1, srcArea = 1;
-    getBatchChannelArea(origin, srcBatch, srcChannel, srcArea);
-    getBatchChannelArea(dest, dstBatch, dstChannel, dstArea);
-    if (dstBatch != srcBatch) {
-        return 0;
-    }
-    if (dstChannel != srcChannel) {
-        return 0;
-    }
-    if (dstArea != srcArea) {
-        return 0;
-    }
-    // just support : [N,C,A] => [N,A,C] or [N,A,C] => [N,C,A]
-    // not support :  [N, X, Y, A] => [N, A, Y, X]
-    if (region.src.stride[1] != 1 && region.size[0] > 1 && region.size[1] > 1 && region.size[2] > 1) {
-        return 0;
-    }
-    auto totalSize = dstBatch * dstChannel * dstArea;
-    int srcSize = 1;
-    int dstSize = 1;
-    int res = 1;
-    for (int i=0; i<3; ++i) {
-        if (region.size[i] == 1) {
-            continue;
-        }
-        if (region.src.stride[i] != region.dst.stride[i]) {
-            if (dstArea == 1) {
-                // Batch / Channel transpose
-                return 0;
-            }
-            res = 2;
-        }
-        srcSize += (region.size[i] - 1) * region.src.stride[i];
-        dstSize += (region.size[i] - 1) * region.dst.stride[i];
-    }
-    if (srcSize != totalSize || dstSize != totalSize ) {
-        return 0;
-    }
-    // Check If it can be described as NHWC <-> NC4HW4 transpose
-    if (2 == res) {
-        int srcChannelStride;
-        int dstChannelStride;
-        int srcAreaStride;
-        int dstAreaStride;
-        if (MNN_DATA_FORMAT_NC4HW4 == srcFormat) {
-            srcChannelStride = srcArea;
-            srcAreaStride = 1;
-            dstChannelStride = 1;
-            dstAreaStride = srcChannel;
-        } else {
-            srcChannelStride = 1;
-            srcAreaStride = srcChannel;
-            dstAreaStride = 1;
-            dstChannelStride = srcArea;
-        }
+struct ReduceInfo {
+    int reduceMask[3] = {0, 0, 0};
+    int reduceNum = 0;
+    int reduceIndex[3];
+    int normalIndex[3];
+    int normalNum = 0;
+    bool compute(const Tensor::InsideDescribe::Region& slice) {
+        normalNum = 0;
+        reduceNum = 0;
         for (int i=0; i<3; ++i) {
-            if (region.size[i] == 1) {
-                continue;
-            }
-            if (region.size[i] == dstBatch) {
-                if (region.src.stride[i] != region.dst.stride[i]) {
-                    return 0;
-                }
-                continue;
-            }
-            if (region.size[i] == srcChannel) {
-                if (region.src.stride[i] != srcChannelStride || region.dst.stride[i] != dstChannelStride) {
-                    return 0;
-                }
-            }
-            if (region.size[i] == srcArea) {
-                if (region.src.stride[i] != srcAreaStride || region.dst.stride[i] != dstAreaStride) {
-                    return 0;
-                }
+            if (slice.size[i] > 1 && slice.dst.stride[i] == 0) {
+                reduceMask[i] = 1;
+                reduceIndex[reduceNum] = i;
+                reduceNum ++;
+            } else {
+                MNN_ASSERT(normalNum < 3);
+                normalIndex[normalNum] = i;
+                normalNum++;
             }
         }
-        return 2;
+        if (0 == reduceNum) {
+            return false;
+        }
+        return true;
     }
-    return 1;
-}
+};
 
 ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std::vector<Tensor *> &outputs) {
     MNN_ASSERT(outputs.size() == 1);
@@ -192,6 +55,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
     auto outputDes = TensorUtils::getDescribe(output);
     mNeedZero = !TensorUtils::regionIsFull(output);
     mZeroPoint = 0;
+    mUseThreads = false;
     if (outputDes->quantAttr != nullptr && outputDes->type == DataType_DT_INT8) {
 #ifdef MNN_USE_SSE
         mZeroPoint = (int)outputDes->quantAttr->zero + 128;
@@ -205,9 +69,9 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
     mTempOutput = nullptr;
     auto midFormat = MNN_DATA_FORMAT_NCHW;
     mTempInputCopy.clear();
-    mOutputPtr = output->host<void>();
     mFast = false;
     auto core = static_cast<CPUBackend*>(backend())->functions();
+    mSingleConvert.type = 0;
     // all_srcFormat == dstFormat == NC4HW4 : Fast Exe
     if (outputDes->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
         mFast = true;
@@ -223,6 +87,7 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
             }
         }
         if (mFast) {
+            mUseThreads = des->regions.size() > 16 ? true : false;
             for (int i=0; i< des->regions.size(); ++i) {
                 auto& slice = des->regions[i];
                 if (slice.origin == nullptr) {
@@ -230,16 +95,16 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
                 }
                 Tensor::InsideDescribe::Region newRegion;
                 OpCommonUtils::turnToPackRegion(slice, newRegion, output, core->pack, true);
-                mFastBlit.emplace_back(std::make_pair(slice.origin->host<void>(), std::move(newRegion)));
+                mFastBlit.emplace_back(std::make_pair(slice.origin, std::move(newRegion)));
             }
             return NO_ERROR;
         }
     }
-    mSingleConvert = 0;
     // srcNum == 1 && srcFormat != dstFormat : Single Convert
     if (des->regions.size() == 1) {
-        mSingleConvert = _singleConvert(des->regions[0], output);
-        if (mSingleConvert > 0) {
+        OpCommonUtils::turnRegion2Convert(des->regions[0], output, mSingleConvert);
+        if (mSingleConvert.type > 0) {
+            mUseThreads = (mSingleConvert.batch * mSingleConvert.area > LAUNCH_MULTI_THREADS_WORKLOAD) ? true : false;
             return NO_ERROR;
         }
     }
@@ -254,19 +119,22 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
         if (!res) {
             return OUT_OF_MEMORY;
         }
-        mOutputPtr = mTempOutput->host<void>();
     }
     // input is NC4HW4 add Convert
     std::vector<Tensor*> forRelease;
+    TensorUtils::FuseWrap fuseUtils;
     for (int i=0; i< des->regions.size(); ++i) {
         auto& slice = des->regions[i];
         auto origin = slice.origin;
-        if (nullptr == origin || nullptr == origin->host<void>()) {
+        if (nullptr == origin /*|| nullptr == origin->host<void>()*/) {
             continue;
         }
         // if tensor is not NC4HW4 or has been merged, don't need deal
         if (TensorUtils::getDescribe(origin)->dimensionFormat != MNN_DATA_FORMAT_NC4HW4) {
-            mTempInputCopy.emplace_back(std::make_pair(origin->host<void>(), &slice));
+            if (slice.size[0] * slice.size[1] * slice.size[2] > LAUNCH_MULTI_THREADS_WORKLOAD) {
+                mUseThreads = true;
+            }
+            mTempInputCopy.emplace_back(std::make_pair(origin, &slice));
             continue;
         }
         // if NC4HW4's C%4 == 0, change convert to transpose and fuse it
@@ -290,12 +158,16 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
             regionTmp.size[1] = core->pack;
             regionTmp.size[2] = area;
             regionTmp.origin = slice.origin;
-            std::shared_ptr<Tensor::InsideDescribe::Region> newSlice(new Tensor::InsideDescribe::Region);
-            *newSlice = slice;
-            bool merge = TensorUtils::fuseRegion(regionTmp, *newSlice);
+            bool merge = fuseUtils.match(regionTmp, slice);
             if (merge) {
+                std::shared_ptr<Tensor::InsideDescribe::Region> newSlice(new Tensor::InsideDescribe::Region);
+                *newSlice = slice;
+                fuseUtils.apply(regionTmp, *newSlice);
                 // cache the merged tensor
-                mTempInputCopy.emplace_back(std::make_pair(origin->host<void>(), newSlice.get()));
+                if (newSlice->size[0] * newSlice->size[1] * newSlice->size[2] > LAUNCH_MULTI_THREADS_WORKLOAD) {
+                    mUseThreads = true;
+                }
+                mTempInputCopy.emplace_back(std::make_pair(origin, newSlice.get()));
                 mCacheRegions.emplace_back(newSlice);
                 continue;
             }
@@ -322,7 +194,10 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
         if (--TensorUtils::getDescribe(tempTensor)->useCount == 0) {
             forRelease.emplace_back(tempTensor);
         }
-        mTempInputCopy.emplace_back(std::make_pair(tempTensor->host<void>(), &slice));
+        if (slice.size[0] * slice.size[1] * slice.size[2] > LAUNCH_MULTI_THREADS_WORKLOAD) {
+            mUseThreads = true;
+        }
+        mTempInputCopy.emplace_back(std::make_pair(tempTensor, &slice));
     }
     for (auto t : forRelease) {
         backend()->onReleaseBuffer(t, Backend::DYNAMIC);
@@ -331,14 +206,25 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
         backend()->onReleaseBuffer(mTempOutput.get(), Backend::DYNAMIC);
     }
     auto threadNumber = static_cast<CPUBackend*>(backend())->threadNumber();
-    if (mTempInputCopy.size() == 1 && threadNumber > 1) {
+    mHasReduce = false;
+    ReduceInfo reduceInfo;
+    for (auto& iter : mTempInputCopy) {
+        if (reduceInfo.compute(*iter.second)) {
+            mHasReduce = true;
+            break;
+        }
+    }
+    if (mTempInputCopy.size() == 1 && threadNumber > 1 && (!mHasReduce)) {
         // Split to multi region
         auto region = mTempInputCopy[0].second;
-        const int thredHold = 100;//TODO: Find better way to determine it
-        if (region->size[0] * region->size[1] * region->size[2] < thredHold) {
+        if (region->size[0] * region->size[1] * region->size[2] < LAUNCH_MULTI_THREADS_WORKLOAD) {
+            mUseThreads = false;
             return NO_ERROR;
         }
-        auto ptr = mTempInputCopy[0].first;
+        if (region->size[0] * region->size[1] * region->size[2] > LAUNCH_MULTI_THREADS_WORKLOAD) {
+            mUseThreads = true;
+        }
+        auto tensorPtr = mTempInputCopy[0].first;
         int pos = -1;
         for (int i=0; i<3; ++i) {
             if (region->size[i] > 1) {
@@ -375,13 +261,13 @@ ErrorCode CPURaster::onResize(const std::vector<Tensor *> &____inputs, const std
             for (int v=pos+1; v<3; ++v) {
                 cacheReg.size[v] = region->size[v];
             }
-            mTempInputCopy.emplace_back(std::make_pair(ptr, cacheRegPtr.get()));
+            mTempInputCopy.emplace_back(std::make_pair(tensorPtr, cacheRegPtr.get()));
             mCacheRegions.emplace_back(cacheRegPtr);
         }
     }
     return NO_ERROR;
 }
-static void _transpose4Bit(int32_t* dstO, const int32_t* srcO, const Tensor::InsideDescribe::Region& region) {
+static void _transpose(int32_t* dstO, const int32_t* srcO, const Tensor::InsideDescribe::Region& region, int bytes) {
     int dims[4], keepDim = -1;
     for (int i = 0; i < 3; i++) {
         if (region.src.stride[i] == 1 && region.size[i] != 1) {
@@ -394,43 +280,27 @@ static void _transpose4Bit(int32_t* dstO, const int32_t* srcO, const Tensor::Ins
             keepDim = i;
         }
     }
-    for (int z=0; z<region.size[keepDim]; ++z) {
-        auto srcZ = srcO + region.src.stride[keepDim] * z;
-        auto dstZ = dstO + region.dst.stride[keepDim] * z;
-        MNNTranspose32Bit(dstZ, srcZ, dims);
+    if (bytes == 4) {
+        for (int z=0; z<region.size[keepDim]; ++z) {
+            auto srcZ = srcO + region.src.stride[keepDim] * z;
+            auto dstZ = dstO + region.dst.stride[keepDim] * z;
+            MNNTranspose32Bit(dstZ, srcZ, dims);
+        }
+        return;
+    }
+    if (bytes == 2) {
+        auto srcH = reinterpret_cast<const int16_t*>(srcO);
+        auto dstH = reinterpret_cast<int16_t*>(dstO);
+        for (int z = 0; z < region.size[keepDim]; ++z) {
+            auto srcZ = srcH + region.src.stride[keepDim] * z;
+            auto dstZ = dstH + region.dst.stride[keepDim] * z;
+            MNNTranspose16Bit(dstZ, srcZ, dims);
+        }
+        return;
     }
 }
 typedef void (*BlitProc)(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds);
 
-static void _4BitcopyWithStride(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
-    auto src = (uint32_t*)srcO;
-    auto dst = (uint32_t*)dstO;
-    for (int i=0; i<size; ++i) {
-        *dst = *src;
-        src+=stride;
-        dst+=ds;
-    }
-}
-
-static void _2BitcopyWithStride(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
-    auto src = (uint16_t*)srcO;
-    auto dst = (uint16_t*)dstO;
-    for (int i=0; i<size; ++i) {
-        *dst = *src;
-        src+=stride;
-        dst+=ds;
-    }
-}
-
-static void _1BitcopyWithStride(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
-    auto src = (uint8_t*)srcO;
-    auto dst = (uint8_t*)dstO;
-    for (int i=0; i<size; ++i) {
-        *dst = *src;
-        src+=stride;
-        dst+=ds;
-    }
-}
 static void _4BitcopyWithStrideC4(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds) {
     auto src = (float*)srcO;
     auto dst = (float*)dstO;
@@ -461,7 +331,7 @@ void CPURaster::executeFaster(const std::vector<Tensor *> &inputs, const std::ve
         ::memset(output->host<void>(), mZeroPoint, static_cast<CPUBackend*>(backend())->getTensorSize(output) * bytes);
     }
     auto byteC4 = bytes * core->pack;
-    auto C4proc = _4BitcopyWithStride;
+    auto C4proc = core->MNN4BitcopyWithStride;
     switch (byteC4) {
         case 16:
             C4proc = _4BitcopyWithStrideC4;
@@ -470,19 +340,22 @@ void CPURaster::executeFaster(const std::vector<Tensor *> &inputs, const std::ve
             C4proc = _2BitcopyWithStrideC4;
             break;
         case 4:
-            C4proc = _4BitcopyWithStride;
+            C4proc = core->MNN4BitcopyWithStride;
             break;
         default:
             C4proc = core->MNNSelectBlitFunction(byteC4);
             break;
+    }
+    if (!mUseThreads) {
+        threadNum = 1;
     }
     MNN_CONCURRENCY_BEGIN(tId, threadNum) {
         for (int u=(int)tId; u<mFastBlit.size(); u+=threadNum) {
             auto& iter = mFastBlit[u];
             auto& slice = iter.second;
             //Offset use byte
-            auto srcPtr = (uint8_t*)iter.first + slice.src.offset * bytes;
-            auto dstPtr = (uint8_t*)mOutputPtr + slice.dst.offset * bytes;
+            auto srcPtr = iter.first->host<uint8_t>() + slice.src.offset * bytes;
+            auto dstPtr = output->host<uint8_t>() + slice.dst.offset * bytes;
             if (slice.src.stride[1] == slice.size[2] && slice.dst.stride[1] == slice.size[2] && slice.src.stride[2] == 1) {
                 for (int z=0; z<slice.size[0]; ++z) {
                     auto srcZ = srcPtr + z * slice.src.stride[0] * byteC4;
@@ -517,17 +390,30 @@ void CPURaster::executeFaster(const std::vector<Tensor *> &inputs, const std::ve
     MNN_CONCURRENCY_END();
 }
 
-static BlitProc _selectUnitProc(int bytes) {
-    auto proc = _1BitcopyWithStride;
+static BlitProc _selectUnitProc(int bytes, int stride, int ds) {
+    auto core = MNNGetCoreFunctions();
+    auto proc = core->MNN1BitcopyFast;
     switch (bytes) {
         case 4:
-            proc = _4BitcopyWithStride;
+            if (ds == 1 && (stride == 1 || stride == 0)) {
+                proc = core->MNN4BitcopyFast;
+            } else {
+                proc = core->MNN4BitcopyWithStride;
+            }
             break;
         case 2:
-            proc = _2BitcopyWithStride;
+            if (ds == 1 && (stride == 1 || stride == 0)) {
+                proc = core->MNN2BitcopyFast;
+            } else {
+                proc = core->MNN2BitcopyWithStride;
+            }
             break;
         case 1:
-            proc = _1BitcopyWithStride;
+            if (ds == 1 && (stride == 1 || stride == 0)) {
+                proc = core->MNN1BitcopyFast;
+            } else {
+                proc = core->MNN1BitcopyWithStride;
+            }
             break;
         default:
             MNN_ASSERT(false);
@@ -545,25 +431,11 @@ static void _zero(const Tensor::InsideDescribe::Region& slice, int bytes, uint8_
     }
 }
 static bool _reduceblit(const Tensor::InsideDescribe::Region& slice, int bytes, const uint8_t* srcPtr, uint8_t* dstPtr) {
-    int reduceMask[3] = {0, 0, 0};
-    int reduceNum = 0;
-    int reduceIndex[3];
-    int normalIndex[3];
-    int normalNum = 0;
-    for (int i=0; i<3; ++i) {
-        if (slice.size[i] > 1 && slice.dst.stride[i] == 0) {
-            reduceMask[i] = 1;
-            reduceIndex[reduceNum] = i;
-            reduceNum ++;
-        } else {
-            normalIndex[normalNum] = i;
-            normalNum++;
-        }
-    }
-    if (0 == reduceNum) {
-        return false;
-    }
-    switch (reduceNum) {
+    ReduceInfo reduceInfo;
+    reduceInfo.compute(slice);
+    auto normalIndex = reduceInfo.normalIndex;
+    auto reduceIndex = reduceInfo.reduceIndex;
+    switch (reduceInfo.reduceNum) {
         case 3:
         {
             float summer = 0.0f;
@@ -639,13 +511,13 @@ static bool _reduceblit(const Tensor::InsideDescribe::Region& slice, int bytes, 
     return false;
 }
 
-static void _blit(const Tensor::InsideDescribe::Region& slice, int bytes, const uint8_t* srcPtr, uint8_t* dstPtr, void(*proc)(uint8_t* dstO, const uint8_t* srcO, int size, int stride, int ds)) {
-#define MNN_BLIT_SUPPORT_REDUCE
-#ifdef MNN_BLIT_SUPPORT_REDUCE
-    if (_reduceblit(slice, bytes, srcPtr, dstPtr)) {
-        return;
+static void _blit(const Tensor::InsideDescribe::Region& slice, int bytes, const uint8_t* srcPtr, uint8_t* dstPtr, bool hasReduce) {
+    auto proc = _selectUnitProc(bytes, slice.src.stride[2], slice.dst.stride[2]);
+    if (hasReduce) {
+        if (_reduceblit(slice, bytes, srcPtr, dstPtr)) {
+            return;
+        }
     }
-#endif
     if (slice.src.stride[1] == slice.size[2] && slice.dst.stride[1] == slice.size[2] && slice.src.stride[2] == 1) {
         for (int z=0; z<slice.size[0]; ++z) {
             auto srcZ = srcPtr + z * slice.src.stride[0] * bytes;
@@ -657,8 +529,10 @@ static void _blit(const Tensor::InsideDescribe::Region& slice, int bytes, const 
         }
         return;
     }
-    if (_transpose(slice) && 4 == bytes) {
-        _transpose4Bit((int32_t*)dstPtr, (const int32_t*)srcPtr, slice);
+    int srcOne, dstOne;
+    if (OpCommonUtils::isTranspose(slice, srcOne, dstOne) && (4 == bytes || 2 == bytes)) {
+    // if (OpCommonUtils::isTranspose(slice, srcOne, dstOne) && 4 == bytes) {
+        _transpose((int32_t*)dstPtr, (const int32_t*)srcPtr, slice, bytes);
         return;
     }
     if (1 == slice.src.stride[2] && 1 == slice.dst.stride[2]) {
@@ -675,7 +549,7 @@ static void _blit(const Tensor::InsideDescribe::Region& slice, int bytes, const 
     }
     for (int z=0; z<slice.size[0]; ++z) {
         auto srcZ = srcPtr + z * slice.src.stride[0] * bytes;
-        auto dstZ = dstPtr + (z) * slice.dst.stride[0] * bytes;
+        auto dstZ = dstPtr + z * slice.dst.stride[0] * bytes;
         for (int y=0; y<slice.size[1]; ++y) {
             auto srcY = srcZ + y * slice.src.stride[1] * bytes;
             auto dstY = dstZ + y * slice.dst.stride[1] * bytes;
@@ -697,6 +571,9 @@ void CPURaster::tensorConvert(Tensor* input, Tensor* output, int bytes) {
     const int bitLength = bytes;
     auto core = static_cast<CPUBackend*>(backend())->functions();
     auto threadNumber = static_cast<CPUBackend*>(backend())->threadNumber();
+    if (!mUseThreads) {
+        threadNumber = 1;
+    }
     MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
         CPUTensorConverter::convert(subIb.host, subOb.host, source, dest, batch, area, channel, bitLength, core, tId, threadNumber);
     };
@@ -705,6 +582,12 @@ void CPURaster::tensorConvert(Tensor* input, Tensor* output, int bytes) {
 
 
 ErrorCode CPURaster::onExecute(const std::vector<Tensor *> &____inputs, const std::vector<Tensor *> &outputs) {
+    void* mOutputPtr = nullptr;
+    if (nullptr != mTempOutput) {
+        mOutputPtr = mTempOutput->host<void>();
+    } else {
+        mOutputPtr = outputs[0]->host<void>();
+    }
     if (mFast) {
         executeFaster(____inputs, outputs);
         return NO_ERROR;
@@ -714,10 +597,9 @@ ErrorCode CPURaster::onExecute(const std::vector<Tensor *> &____inputs, const st
     auto bytes = CPUBackend::getBytes(backend(), output);
     auto outputEleSize = static_cast<CPUBackend*>(backend())->getTensorSize(output);
     auto threadNum = static_cast<CPUBackend*>(backend())->threadNumber();
-    if (mSingleConvert > 0) {
-        auto realInput = TensorUtils::getDescribe(output)->regions[0].origin;
-        int srcBatch = 1, srcChannel = 1, srcArea = 1;
-        getBatchChannelArea(realInput, srcBatch, srcChannel, srcArea);
+    if (mSingleConvert.type > 0) {
+        auto realInput = ____inputs[0];
+        int srcBatch = mSingleConvert.batch, srcChannel = mSingleConvert.channel, srcArea = mSingleConvert.area;
         auto sourceFormat = TensorUtils::getDescribe(realInput)->dimensionFormat;
         auto destFormat = TensorUtils::getDescribe(output)->dimensionFormat;
         auto channelC4 = UP_DIV(srcChannel, core->pack);
@@ -731,19 +613,25 @@ ErrorCode CPURaster::onExecute(const std::vector<Tensor *> &____inputs, const st
                 return NO_ERROR;
             }
             inputBatchStride = batchStrideC4;
-            if (2 == mSingleConvert) {
+            if (2 == mSingleConvert.type) {
                 destFormat = MNN_DATA_FORMAT_NHWC;
+            } else {
+                destFormat = MNN_DATA_FORMAT_NCHW;
             }
-        }
-        if (MNN_DATA_FORMAT_NC4HW4 == destFormat) {
+        } else if (MNN_DATA_FORMAT_NC4HW4 == destFormat) {
             if (output->dimensions() <= 1) {
                 ::memcpy(output->host<uint8_t>(), realInput->host<uint8_t>(), realInput->elementSize() * bytes);
                 return NO_ERROR;
             }
             outputBatchStride = batchStrideC4;
-            if (2 == mSingleConvert) {
+            if (2 == mSingleConvert.type) {
                 sourceFormat = MNN_DATA_FORMAT_NHWC;
+            } else {
+                sourceFormat = MNN_DATA_FORMAT_NCHW;
             }
+        }
+        if (!mUseThreads) {
+            threadNum = 1;
         }
         MNN_CONCURRENCY_BEGIN(tId, threadNum) {
             CPUTensorConverter::convert(realInput->host<uint8_t>(), output->host<uint8_t>(), sourceFormat, destFormat, srcBatch, srcArea, srcChannel, bytes, core, tId, threadNum);
@@ -761,14 +649,20 @@ ErrorCode CPURaster::onExecute(const std::vector<Tensor *> &____inputs, const st
     for (auto& iter : mTempInput) {
         tensorConvert(iter.first, iter.second, bytes);
     }
-    auto proc = _selectUnitProc(bytes);
+    if (mHasReduce) {
+        // Don't support reduce with multi thread now
+        threadNum = 1;
+    }
+    if (!mUseThreads) {
+        threadNum = 1;
+    }
     MNN_CONCURRENCY_BEGIN(tId, threadNum) {
         for (int u=tId; u<mTempInputCopy.size(); u+=threadNum) {
             auto& iter = mTempInputCopy[u];
             auto& slice = *(iter.second);
-            auto srcPtr = (uint8_t*)iter.first + slice.src.offset * bytes;
+            auto srcPtr = iter.first->host<uint8_t>() + slice.src.offset * bytes;
             auto dstPtr = (uint8_t*)mOutputPtr + slice.dst.offset * bytes;
-            _blit(slice, bytes, srcPtr, dstPtr, proc);
+            _blit(slice, bytes, srcPtr, dstPtr, mHasReduce);
         }
     }
     MNN_CONCURRENCY_END();
@@ -911,13 +805,12 @@ public:
         }
         auto threadNumber = static_cast<CPUBackend*>(backend())->threadNumber();
         if (mMaxCacheSize > 0 || mMaxFuseBufferSize > 0) {
-            auto buffer = static_cast<CPUBackend*>(backend())->getBufferAllocator()->alloc(threadNumber * (mMaxCacheSize + mMaxFuseBufferSize));
-            if (nullptr == buffer.first) {
+            mCacheBuffer = static_cast<CPUBackend*>(backend())->getBufferAllocator()->alloc(threadNumber * (mMaxCacheSize + mMaxFuseBufferSize));
+            if (mCacheBuffer.invalid()) {
                 return OUT_OF_MEMORY;
             }
-            mCacheBuffer = (uint8_t*)buffer.first + buffer.second;
             mFuseBuffer = mCacheBuffer + threadNumber * mMaxCacheSize;
-            static_cast<CPUBackend*>(backend())->getBufferAllocator()->free(buffer);
+            static_cast<CPUBackend*>(backend())->getBufferAllocator()->free(mCacheBuffer);
         }
         return NO_ERROR;
     }
@@ -946,8 +839,7 @@ public:
                     if (halide_type_float == input->getType().code) {
                         bytes = cpubackend->functions()->bytes;
                     }
-                    auto proc = _selectUnitProc(bytes);
-                    _blit(reg, bytes, input->host<uint8_t>(), output->host<uint8_t>(), proc);
+                    _blit(reg, bytes, input->host<uint8_t>(), output->host<uint8_t>(), false);
                 }
 
             }
@@ -979,13 +871,13 @@ public:
                 ::memcpy(reg.src.stride, srcView->stride()->data(), 3 * sizeof(int32_t));
                 ::memcpy(reg.dst.stride, dstView->stride()->data(), 3 * sizeof(int32_t));
                 auto input = mStack[cmd->indexes()->data()[1]];
-                auto inputSize = input->elementSize();
+                auto inputSize = input->usize() / input->buffer().type.bytes();
                 auto output = mStack[cmd->indexes()->data()[0]];
+                auto outputSize = output->usize() / output->buffer().type.bytes();
                 auto bytes = input->getType().bytes();
                 if (halide_type_float == input->getType().code) {
                     bytes = static_cast<CPUBackend*>(backend())->functions()->bytes;
                 }
-                auto proc = _selectUnitProc(bytes);
                 auto step0 = cmd->steps()->data()[0];
                 auto step1 = cmd->steps()->data()[1];
                 auto loopNumber = mLoop->loopNumber();
@@ -994,10 +886,12 @@ public:
                     auto dstIter = *(iter0 + iter0Stride * iter);
                     auto srcOffset = srcIter * step1 + srcView->offset();
                     auto dstOffset = dstIter * step0 + dstView->offset();
-                    if (srcOffset >= 0 && srcOffset < inputSize) {
-                        _blit(reg, bytes, input->host<uint8_t>() + bytes * srcOffset, output->host<uint8_t>() + bytes * dstOffset, proc);
-                    } else {
-                        _zero(reg, bytes, output->host<uint8_t>() + bytes * dstOffset);
+                    if (dstOffset >= 0 && dstOffset < outputSize) {
+                        if (srcOffset >= 0 && srcOffset < inputSize) {
+                            _blit(reg, bytes, input->host<uint8_t>() + bytes * srcOffset, output->host<uint8_t>() + bytes * dstOffset, false);
+                        } else {
+                            _zero(reg, bytes, output->host<uint8_t>() + bytes * dstOffset);
+                        }
                     }
                 }
                 return NO_ERROR;
@@ -1005,12 +899,12 @@ public:
         }
         auto bytes = static_cast<CPUBackend*>(backend())->functions()->bytes;
         auto func = [&](int iter, int tId) {
-            auto blit = _selectUnitProc(bytes);
             int fuseOutputStride[3];
             const int32_t* outputStride = nullptr;
             auto fuseBuffer = mFuseBuffer + mMaxFuseBufferSize * tId;
             for (int index=0; index<mLoop->commands()->size(); ++index) {
                 auto cmd = mLoop->commands()->GetAs<RegionCommand>(index);
+                auto blit = _selectUnitProc(bytes, cmd->view()->GetAs<View>(1)->stride()->data()[2], 1);
                 auto op = cmd->op();
                 int iterIndexsize = cmd->iterIndexes()->size();
                 
@@ -1024,14 +918,14 @@ public:
                     // Loop Op's command's first index must be output
                     outputStride = cmd->view()->GetAs<View>(0)->stride()->data();
                 }
-                halide_type_t outputType;
+                halide_type_t inputType;
                 for (int v=0; v<iterIndexsize; ++v) {
                     auto tensorIndex = cmd->indexes()->data()[v];
                     auto tensor = mStack[tensorIndex];
                     auto iterIndex = cmd->iterIndexes()->data()[v];
                     auto offset = iter;
-                    if (0 == v) {
-                        outputType = tensor->getType();
+                    if (1 == v) {
+                        inputType = tensor->getType();
                     }
                     if (iterIndex >= 0) {
                         offset = mStack[iterIndex]->host<int32_t>()[iter];
@@ -1044,7 +938,7 @@ public:
                 auto dstOrigin = (uint8_t*)mContainer[tId].stackPtr[cmd->indexes()->data()[0]];
                 auto dst = dstOrigin;
                 if (cmd->fuse() >= 0) {
-                    dst = fuseBuffer;
+                    dst = fuseBuffer.ptr();
                 }
                 do {
                     if (OpType_UnaryOp == op->type()) {
@@ -1057,11 +951,10 @@ public:
                             ::memcpy(reg.size, cmd->size()->data(), 3 * sizeof(int32_t));
                             ::memcpy(reg.src.stride, srcView->stride()->data(), 3 * sizeof(int32_t));
                             ::memcpy(reg.dst.stride, outputStride, 3 * sizeof(int32_t));
-                            auto proc = _selectUnitProc(bytes);
                             auto step0 = cmd->steps()->data()[0];
                             auto step1 = cmd->steps()->data()[1];
                             auto loopNumber = mLoop->loopNumber();
-                            _blit(reg, bytes, (const uint8_t*)src, (uint8_t*)dst, proc);
+                            _blit(reg, bytes, (const uint8_t*)src, (uint8_t*)dst, false);
                             break;
                         }
                         auto proc = static_cast<CPUBackend*>(backend())->functions()->MNNSelectUnaryFunctionForFloat(op->main_as_UnaryOp()->opType(), static_cast<CPUBackend*>(backend())->precisionMode());
@@ -1078,7 +971,7 @@ public:
                             }
                         } else {
                             // Blit to cache
-                            auto srcCache = mCacheBuffer + mMaxCacheSize * tId;
+                            auto srcCache = mCacheBuffer.ptr() + mMaxCacheSize * tId;
                             for (int z=0; z<cmd->size()->data()[0]; ++z) {
                                 auto srcZ = src + z * cmd->view()->GetAs<View>(1)->stride()->data()[0] * bytes;
                                 auto dstZ = dst + z * outputStride[0] * bytes;
@@ -1110,10 +1003,10 @@ public:
                     if (OpType_BinaryOp == op->type()) {
                         auto src0 = mContainer[tId].stackPtr[cmd->indexes()->data()[1]];
                         MNNBinaryExecute proc;
-                        if (outputType.code == halide_type_float) {
+                        if (inputType.code == halide_type_float) {
                             proc = static_cast<CPUBackend*>(backend())->functions()->MNNSelectBinaryFunctionForFloat(op->main_as_BinaryOp()->opType());
                         } else {
-                            MNN_ASSERT(outputType.code == halide_type_int);
+                            MNN_ASSERT(inputType.code == halide_type_int);
                             proc = CPUBinary::selectForInt(op->main_as_BinaryOp()->opType());
                         }
                         auto lastS = cmd->size()->data()[2];
@@ -1122,6 +1015,8 @@ public:
                         MNN_ASSERT(stride0[2] == 1);
                         auto src1 = mContainer[tId].stackPtr[cmd->indexes()->data()[2]];
                         auto stride2 = cmd->view()->GetAs<View>(2)->stride()->data();
+                        auto blit1   = _selectUnitProc(bytes, stride1[2], 1);
+                        auto blit2   = _selectUnitProc(bytes, stride2[2], 1);
                         if (cmd->size()->data()[2] == 1 || (stride1[2] == 1 && stride2[2] == 1)) {
                             for (int z=0; z<cmd->size()->data()[0]; ++z) {
                                 auto src0Z = src0 + z * stride1[0] * bytes;
@@ -1135,7 +1030,7 @@ public:
                                 }
                             }
                         } else {
-                            auto cache0 = mCacheBuffer + mMaxCacheSize * tId;
+                            auto cache0 = mCacheBuffer.ptr() + mMaxCacheSize * tId;
                             auto cache1 = cache0 + cmd->size()->data()[2] * bytes;
                             for (int z=0; z<cmd->size()->data()[0]; ++z) {
                                 auto src0Z = src0 + z * stride1[0] * bytes;
@@ -1145,8 +1040,8 @@ public:
                                     auto src0Y = src0Z + y * stride1[1] * bytes;
                                     auto src1Y = src1Z + y * stride2[1] * bytes;
                                     auto dstY = dstZ + y * stride0[1] * bytes;
-                                    blit(cache0, src0Y, cmd->size()->data()[2], stride1[2], 1);
-                                    blit(cache1, src1Y, cmd->size()->data()[2], stride2[2], 1);
+                                    blit1(cache0, src0Y, cmd->size()->data()[2], stride1[2], 1);
+                                    blit2(cache1, src1Y, cmd->size()->data()[2], stride2[2], 1);
                                     proc(dstY, cache0, cache1, cmd->size()->data()[2], -1);
                                 }
                             }
@@ -1237,9 +1132,8 @@ private:
     const LoopParam* mLoop;
     std::vector<Tensor*> mStack;
     std::vector<ThreadContainer> mContainer;
-    uint8_t* mCacheBuffer = nullptr;
+    MemChunk mCacheBuffer, mFuseBuffer;
     int mMaxCacheSize = 0;
-    uint8_t* mFuseBuffer = nullptr;
     int mMaxFuseBufferSize = 0;
 };
 

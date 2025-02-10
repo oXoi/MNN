@@ -40,34 +40,37 @@ public:
 };
 class CPUConvolution : public Execution {
 public:
+    struct ResourceDequantizeInfo {
+        int bits = 32;
+        std::shared_ptr<Tensor> mScaleBias;
+    };
     struct Resource {
+        std::shared_ptr<Tensor> mWeightKernelSum;
         std::shared_ptr<Tensor> mWeight;
         std::shared_ptr<Tensor> mBias;
+        ResourceDequantizeInfo mDequantize;
         Backend* backend;
         bool copyBiasAlign(const float* bias, int outputCount);
-        ~ Resource() {
-            if (nullptr != mBias) {
-                backend->onReleaseBuffer(mBias.get(), Backend::STATIC);
-            }
-            if (nullptr != mWeight) {
-                backend->onReleaseBuffer(mWeight.get(), Backend::STATIC);
-            }
-        }
+        int hU;
+        int lU;
+        int lP;
+        int hP;
+        std::vector<float> mReluThreshold;
     };
     struct ResourceInt8 {
-        std::vector<int> mInt8WeightKernelSum;
-        std::shared_ptr<Tensor> mWeightInt8;
-        std::shared_ptr<Tensor> mOriginBias;
-        std::shared_ptr<Tensor> mOriginScale;
+        std::vector<int> mInt8WeightKernelSum;     // PTQ's   sum, DynamicQ not use
+        std::shared_ptr<Tensor> mWeightInt8;       // PTQ's   and  DynamicQ's weight
+        std::shared_ptr<Tensor> mOriginBias;       // PTQ's   and  DynamicQ's bias
+        std::shared_ptr<Tensor> mOriginScale;      // PTQ's scale + bias, DynamicQ's alpha + zero;
+        std::shared_ptr<Tensor> mWeightQuantZero;  // PTQ's  zero
+        std::shared_ptr<Tensor> mWeightKernelSum;  // PTQ's   and  DynamicQ's weight kernel sum;
+        std::vector<float> mReluThreshold;
         // relu or relu6
         bool mRelu;
-        int mActBits;
+        int mActBits;  // quant bits
 
-        int mOutputCount;
         bool mUseConvQuan = true;
-#ifdef MNN_USE_SSE
-        std::vector<int> offsets;
-#endif
+        bool mWeightAsymmetricQuant = true;
         // Origin Attributes from net
         float mInputScale = 0.0f;
         float mOutputScale = 0.0f;
@@ -75,6 +78,7 @@ public:
         int32_t mOutputZeroPoint;
         int8_t mClampMin;
         int8_t mClampMax;
+        bool mDynamicQuant = false;
     };
     struct MutableResourceInt8 {
         MutableResourceInt8(std::shared_ptr<ResourceInt8> res, Backend* backend);
@@ -88,19 +92,16 @@ public:
         int8_t mClampMax;
         std::shared_ptr<Tensor> mBiasInt32;
         std::shared_ptr<Tensor> mScaleFloat;
+        std::shared_ptr<Tensor> mBiasFloat;
+        int32_t mShiftBits = 14;
         bool mValid;
     };
-    static std::shared_ptr<ResourceInt8> makeResourceInt8(Backend *backend, const MNN::Convolution2D *convOp);
+    static std::shared_ptr<ResourceInt8> makeResourceInt8(Backend *backend, const MNN::Op *op, int pack=4);
     CPUConvolution(const Convolution2DCommon *convOp, Backend *b);
     virtual ~CPUConvolution() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
     static int reorderWeightSize(int depth, int outputCount, int kernelSize, int unitDepth, int unitOC);
-
-    /* Inefficient because of not use memcpy to support different type copy (T -> U), use it when speed insensitive (init, onResize)
-       return: False if acquire failed
-     */
-    template<typename T, typename U> static bool acquireMemoryAndCopy(std::shared_ptr<Tensor> dest, const T* source, size_t count, Backend*);
 
     std::vector<float> getPostParameters() const;
 public:

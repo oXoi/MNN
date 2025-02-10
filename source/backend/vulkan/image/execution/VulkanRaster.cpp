@@ -58,7 +58,7 @@ void VulkanRaster::onEncodeFast(const Tensor* input, const Tensor* output, const
         uniformInfo.imageSize[3] = image->width() * image->height();
         std::shared_ptr<VulkanBuffer> uniform(new VulkanBuffer(vkBn->getMemoryPool(), false, sizeof(FillImage), &uniformInfo, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT));
         mExtraUniform.emplace_back(uniform);
-        std::shared_ptr<VulkanPipeline::DescriptorSet> des(fillPipeline->createSet());
+        std::shared_ptr<VulkanLayout::DescriptorSet> des(fillPipeline->createSet());
         des->writeImage(image->view(), vkBn->getCommonSampler()->get(), VK_IMAGE_LAYOUT_GENERAL, 0);
         des->writeBuffer(uniform->buffer(), 1, uniform->size());
         auto totalSize = UP_DIV(uniformInfo.imageSize[3], 256);
@@ -156,8 +156,6 @@ ErrorCode VulkanRaster::onEncode(const std::vector<Tensor *> &___inputs, const s
         for (int i=0; i<origin->dimensions(); ++i) {
             bufferSize *= origin->length(i);
         }
-        ivec4 dims;
-        writeNCHW(dims, origin);
         ConvertInfo info;
         info.buffer.reset(new VulkanBuffer(vkBn->getDynamicMemoryPool(),
                                            false, bufferSize, nullptr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
@@ -212,6 +210,7 @@ ErrorCode VulkanRaster::onEncode(const std::vector<Tensor *> &___inputs, const s
     for (auto& iter : mInputBuffers) {
         auto& info = iter.second;
         info.convert->encodeTensorToBuffer(iter.first, info.buffer->buffer(), info.buffer->size(), 0, VulkanImageConverter::getTensorLinearFormat(iter.first), cmdBuffer);
+        cmdBuffer->barrierSource(info.buffer->buffer(), 0, info.buffer->size());
     }
     //Blit
     if (needZero) {
@@ -223,7 +222,6 @@ ErrorCode VulkanRaster::onEncode(const std::vector<Tensor *> &___inputs, const s
         info.describe->writeBuffer(info.srcBuffer, 1, info.srcBufferSize);
         info.describe->writeBuffer(info.uniform->buffer(), 2, info.uniform->size());
         info.pipeline->bind(cmdBuffer->get(), info.describe->get());
-        cmdBuffer->barrierSource(info.srcBuffer, 0, info.srcBufferSize);
         vkCmdDispatch(cmdBuffer->get(), info.workGroup[0], info.workGroup[1], info.workGroup[2]);
     }
 
@@ -238,88 +236,16 @@ ErrorCode VulkanRaster::onEncode(const std::vector<Tensor *> &___inputs, const s
 class VulkanRasterCreator : public VulkanBackend::Creator {
 public:
     virtual VulkanBasicExecution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const MNN::Op* op, Backend* bn) const override {
+        if (outputs[0]->getType().bytes() < 4) {
+            return nullptr;
+        }
         return new VulkanRaster(bn);
-    }
-};
-
-
-class VulkanLoop : public VulkanBasicExecution {
-public:
-    VulkanLoop(Backend *bn, const LoopParam* loop) : VulkanBasicExecution(bn) {
-        mLoop = loop;
-    }
-    virtual ~VulkanLoop() = default;
-
-    virtual ErrorCode onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
-                               const VulkanCommandPool::Buffer *cmdBuffer) override {
-        mExecutions.clear();
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
-        std::vector<Tensor*> tensors(mLoop->tensorNumber());
-        for (int i=0; i<mLoop->inputIndexes()->size(); ++i) {
-            tensors[mLoop->inputIndexes()->data()[i]] = inputs[i];
-        }
-        for (int i=0; i<mLoop->outputIndexes()->size(); ++i) {
-            tensors[mLoop->outputIndexes()->data()[i]] = outputs[i];
-        }
-        auto C = tensors[cmd->indexes()->data()[0]];
-        auto A = tensors[cmd->indexes()->data()[1]];
-        auto B = tensors[cmd->indexes()->data()[2]];
-        for (int i=0; i<mLoop->loopNumber(); ++i) {
-            VulkanMatMul::MatMulInfo matInfo;
-            matInfo.e = cmd->size()->data()[0];
-            matInfo.l = cmd->size()->data()[1];
-            matInfo.h = cmd->size()->data()[2];
-            matInfo.offsetC = cmd->view()->GetAs<View>(0)->offset() + i * cmd->steps()->data()[0];
-            matInfo.offsetA = cmd->view()->GetAs<View>(1)->offset() + i * cmd->steps()->data()[1];
-            matInfo.offsetB = cmd->view()->GetAs<View>(2)->offset() + i * cmd->steps()->data()[2];
-            ::memcpy(matInfo.aStride, cmd->view()->GetAs<View>(1)->stride()->data(), 3 * sizeof(int));
-            ::memcpy(matInfo.bStride, cmd->view()->GetAs<View>(2)->stride()->data(), 3 * sizeof(int));
-            ::memcpy(matInfo.cStride, cmd->view()->GetAs<View>(0)->stride()->data(), 3 * sizeof(int));
-            Tensor* bias = nullptr;
-            if (cmd->indexes()->size() > 3) {
-                bias = tensors[cmd->indexes()->data()[3]];
-                matInfo.offsetBias = cmd->view()->GetAs<View>(3)->offset() + i * cmd->steps()->data()[3];
-            }
-            auto matmulOp = cmd->op();
-            std::shared_ptr<VulkanBasicExecution> exe(new VulkanMatMul(matmulOp->main_as_MatMul()->transposeA(), matmulOp->main_as_MatMul()->transposeB(), backend()));
-            auto matmulExe = static_cast<VulkanMatMul*>(exe.get());
-            bool res = true;
-            if (bias == nullptr) {
-                res = matmulExe->encode({{A, B}}, {C}, cmdBuffer, matInfo);
-            } else {
-                res = matmulExe->encode({{A, B, bias}}, {C}, cmdBuffer, matInfo);
-            }
-            if (!res) {
-                return NOT_SUPPORT;
-            }
-            mExecutions.emplace_back(exe);
-        }
-        return NO_ERROR;
-    }
-private:
-    std::vector<std::shared_ptr<VulkanBasicExecution>> mExecutions;
-    const LoopParam* mLoop;
-};
-
-class VulkanLoopCreator : public VulkanBackend::Creator {
-public:
-    virtual VulkanBasicExecution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const MNN::Op* op, Backend* bn) const override {
-        auto loop = op->main_as_LoopParam();
-        if (1 != loop->commands()->size()) {
-            return nullptr;
-        }
-        auto cmd = loop->commands()->GetAs<RegionCommand>(0);
-        if (OpType_MatMul != cmd->op()->type()) {
-            return nullptr;
-        }
-        return new VulkanLoop(bn, loop);
     }
 };
 
 
 static bool gResistor = []() {
     VulkanBackend::addCreator(OpType_Raster, new VulkanRasterCreator);
-//    VulkanBackend::addCreator(OpType_While, new VulkanLoopCreator);
     return true;
 }();
 

@@ -6,7 +6,7 @@
 代码位置：`demo/exec/multiPose.cpp`
 
 1. 下载原始的Tensorflow模型 [pose model](https://github.com/czy2014hust/posenet-python/raw/master/models/model-mobilenet_v1_075.pb)
-2. 使用 [模型转换工具](../tools/convert.md) 转换为 MNN 模型
+2. 使用 [模型转换工具](../tools/convert.md) 转换为 MNN 模型，转换时加上参数 --keepInputFormat=0 【把输入由NHWC转换为NC4HW4布局】
 3. 执行姿态检测
     ```bash
     ./multiPose.out model.mnn input.png pose.png
@@ -186,12 +186,50 @@ $ python test_save.py
 ```bash
 $  python quant_aware_training.py --model_file quant_demo/mobilenet_v2_tfpb_train_withBN.mnn --val_image_path quant_demo/quant_imgs --val_txt quant_demo/val.txt
 ```
+## Android Demo
+代码位置：`project/android/demo`
+
+按照`project/android/demo/READNE.md`的步骤，首先安装开发所需工具；然后下载并转换模型；之后就可以编译成Android APP执行测试。
+
+效果示例：
+
+![android_demo.png](../_static/images/start/android_demo.jpg)
+
+## iOS Demo
+### 模型下载与转换：
+首先编译(如果已编译可以跳过)`MNNConvert`，操作如下：
+```
+cd MNN
+mkdir build && cd build
+cmake -DMNN_BUILD_CONVERTER=ON ..
+make -j8
+```
+
+然后下载并转换模型：
+切到编译了 MNNConvert 的目录，如上为 build 目录，执行
+```
+sh ../tools/script/get_model.sh
+```
+
+### 工程编译
+代码位置：`project/ios`
+
+使用`xcode`打开`project/ios/MNN.xcodeproj`, `target`选择`demo`,既可编译运行。
+
+效果示例：
+
+![ios_demo.png](../_static/images/start/ios_demo.jpg)
+
 
 ## Github Demo
 
 **欢迎开发者提供示例，可以在issue中提交自己的示例项目，审核通过后可以再此处展示**
 
-以下示例为Github开发者贡献，具体用法需参考相关代码；
+### 以下示例为Github开发者贡献，具体用法需参考相关代码；
+- [mobilenet-mnn](https://github.com/wangzhaode/mobilenet-mnn)
+- [yolov8-mnn](https://github.com/wangzhaode/yolov8-mnn)
+- [stable-diffusion-mnn](https://github.com/wangzhaode/stable-diffusion-mnn)
+- [ChatGLM-MNN](https://github.com/wangzhaode/ChatGLM-MNN)
 - [图像算法工具箱](https://github.com/DefTruth/lite.ai.toolkit)
 - [嵌入式设备部署示例](https://github.com/xindongzhang/MNN-APPLICATIONS)
 - [车道线检测](https://github.com/MaybeShewill-CV/MNN-LaneNet)

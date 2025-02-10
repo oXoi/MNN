@@ -65,6 +65,10 @@ table IDSTQuan {
     aMin:int;
     readType:int;
     has_scaleInt:bool;
+    shapeInt32:bool = false;
+    // For sparse
+    weightSize:uint32;
+    index:[uint32];
 }
 
 enum QuantizeAlgo : byte {
@@ -91,6 +95,8 @@ table QuantizedFloatParam{
     clampMax: byte = 127;
     // binary proto: [originKySize, originKxSize, transKySize, transKxSize, {kyStart, kxStart, unitY, unitX}, {...} ...]
     winogradAttr:[int];
+    outputDataType:DataType=DT_INT8;
+    floatzeros: [float];
 }
 
 table Convolution2D {
@@ -289,6 +295,7 @@ table RoiParameters {
     samplingRatio:int = -1;
     aligned:bool = false;
     poolType:PoolType = AVEPOOL;
+    outputGrad:bool = false;
 }
 
 table Proposal {

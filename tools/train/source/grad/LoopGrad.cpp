@@ -8,7 +8,7 @@
 
 #include "OpGrad.hpp"
 using namespace std;
-using namespace MNN;
+namespace MNN {
 using namespace MNN::Express;
 
 class LoopGrad : public OpGrad {
@@ -167,6 +167,7 @@ public:
                 dstCommands.emplace_back(std::move(currentCommand));
                 return;
             }
+            FUNC_PRINT(1);
         }
         int inputSize = 0;
         std::vector<VARP> inputs;
@@ -395,8 +396,12 @@ public:
     }
 };
 
-static const auto gRegister = []() {
+static void _create() {
     static LoopGrad _c;
     OpGrad::insert(OpType_While, &_c);
-    return true;
-}();
+
+}
+
+REGISTER_GRAD(LoopGrad_cpp, _create);
+};
+

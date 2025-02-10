@@ -17,9 +17,9 @@
 #include "execution/Raster.cuh"
 #include "execution/Transpose.cuh"
 #include "execution/MNNCUDADefine.hpp"
-
+#include "execution/CastExecution.hpp"
 #include "CUDATools.hpp"
-
+#include "execution/FuseExecutionV2.hpp"
 // #define MNN_CUDA_COPY_DEBUG
 
 namespace MNN {
@@ -37,18 +37,18 @@ public:
         // Do nothing
     }
     virtual ~ CUDARuntimeAllocator() = default;
-    virtual std::pair<void*, size_t> onAlloc(size_t size, size_t align) override {
-        return std::make_pair(mRuntime->alloc(size), 0);
+    virtual MemChunk onAlloc(size_t size, size_t align) override {
+        return MemChunk(mRuntime->alloc(size), 0);
     }
-    virtual void onRelease(std::pair<void*, size_t> ptr) override {
+    virtual void onRelease(MemChunk ptr) override {
         mRuntime->free(ptr.first);
     }
 private:
     CUDARuntime* mRuntime;
 };
-CUDARuntimeWrapper::CUDARuntimeWrapper(BackendConfig::PrecisionMode precision, BackendConfig::PowerMode power) {
+CUDARuntimeWrapper::CUDARuntimeWrapper(BackendConfig::PrecisionMode precision, BackendConfig::PowerMode power, BackendConfig::MemoryMode memory, int deviceId) {
     // TODO: Search CUDA Device info and use best one
-    mCUDARuntime.reset(new CUDARuntime(-1));
+    mCUDARuntime.reset(new CUDARuntime(deviceId));
 #ifdef LOG_VERBOSE
     MNN_PRINT("create cuda runtime:%p\n", mCUDARuntime.get());
 #endif
@@ -58,9 +58,10 @@ CUDARuntimeWrapper::CUDARuntimeWrapper(BackendConfig::PrecisionMode precision, B
             return;
         }
         std::shared_ptr<BufferAllocator::Allocator> allocator(new CUDARuntimeAllocator(mCUDARuntime.get()));
-        mBufferPool.reset(new BufferAllocator(allocator));
+        mBufferPool.reset(new EagerBufferAllocator(allocator));
     }
     mDefaultPrecision = precision;
+    mDefaultMemory = memory;
 }
 CUDARuntimeWrapper::~CUDARuntimeWrapper() {
     // Do nothing
@@ -70,24 +71,36 @@ float CUDARuntimeWrapper::onGetMemoryInMB() {
     return staticMemoryInMB;
 }
 
-Backend* CUDARuntimeWrapper::onCreate(const BackendConfig* config) const {
+std::pair<const void*, size_t> CUDARuntimeWrapper::onGetCache() {//make Cache
+    return mCUDARuntime->makeCache();
+}
+
+bool CUDARuntimeWrapper::onSetCache(const void* buffer, size_t size) {//set Cache
+    return mCUDARuntime->setCache(std::make_pair(buffer, size));
+}
+
+Backend* CUDARuntimeWrapper::onCreate(const BackendConfig* config, Backend* origin) const {
 #ifdef LOG_VERBOSE
     MNN_PRINT("cudaruntime:%p, create CUDABackend\n", this);
 #endif
-    auto mode = mDefaultPrecision;
+    auto precision_mode = mDefaultPrecision;
+    auto memory_mode = mDefaultMemory;
     if (nullptr != config) {
-        mode = config->precision;
+        precision_mode = config->precision;
+        memory_mode = config->memory;
     }
     int precision = 0; 
-    if(mode == BackendConfig::Precision_Low) {
+    if(precision_mode == BackendConfig::Precision_Low) {
         precision = 2;
-    } else if(mode == BackendConfig::Precision_Normal) {
+    } else if(precision_mode == BackendConfig::Precision_Normal) {
         precision = 0;
+    } else if(precision_mode == BackendConfig::Precision_Low_BF16) {
+        precision = 3;
     } else {
         precision = 1;
     }
 
-    return new CUDABackend(mBufferPool, mCUDARuntime, precision);
+    return new CUDABackend(mBufferPool, mCUDARuntime, precision, memory_mode);
 }
 
 void CUDARuntimeWrapper::onGabageCollect(int level) {
@@ -96,16 +109,18 @@ void CUDARuntimeWrapper::onGabageCollect(int level) {
 
 
 CUDABackend::CUDABackend(std::shared_ptr<BufferAllocator> st,
-                         std::shared_ptr<CUDARuntime> rt, int precision)
+                         std::shared_ptr<CUDARuntime> rt,
+                        int precision, BackendConfig::MemoryMode memory)
     : Backend(MNN_FORWARD_CUDA) {
 #ifdef LOG_VERBOSE
         MNN_PRINT("cuda backend create\n");
 #endif
-    mBufferPool.reset(new BufferAllocator(BufferAllocator::Allocator::createRecurse(st.get())));
+    mBufferPool.reset(new EagerBufferAllocator(BufferAllocator::Allocator::createRecurse(st.get())));
     mStaticBufferPool = st;
     mCUDARuntime      = rt;
     mUseFp16AsFp32 = (precision == 2);
     mPrecision = precision;
+    mMemory = memory;
 }
 
 CUDABackend::~CUDABackend() {
@@ -124,29 +139,46 @@ const Runtime* CUDABackend::getRuntime() {
 bool CUDABackend::useFp16() const {
     return mUseFp16AsFp32;
 }
+
+#ifdef MNN_CODEGEN_CUDA
+std::map<std::pair<std::string, std:: string>, CUmodule> CUDABackend::kernelCuModuleMap() {
+    return mKernelCuModuleMap;
+}
+#endif
+
 int CUDABackend::getPrecision() const {
     return mPrecision;
 }
 
+BackendConfig::MemoryMode CUDABackend::getMemoryMode() const {
+    return mMemory;
+}
 class CUDAMemObj : public Backend::MemObj {
 public:
-    CUDAMemObj(BufferAllocator* allocator, std::pair<void*, int> points) {
+    CUDAMemObj(BufferAllocator* allocator, MemChunk points) {
         mPoint = std::move(points);
         mAllocator = allocator;
     }
     virtual ~ CUDAMemObj() {
         mAllocator->free(mPoint);
     }
+    MemChunk chunk() override {
+        return mPoint;
+    }
 private:
     BufferAllocator* mAllocator;
-    std::pair<void*, int> mPoint;
+    MemChunk mPoint;
 };
 int CUDABackend::getBytes(const Tensor* tensor) const {
     auto bytes = tensor->getType().bytes();
-    if (mUseFp16AsFp32) {
+    if (mPrecision == 2 || mPrecision == 3) {// Fp16 or Bf16
         if (halide_type_float == tensor->getType().code) {
             bytes = 2;
         }
+    }
+    auto quant = TensorUtils::getDescribe(tensor)->quantAttr.get();
+    if (nullptr != quant && TensorUtils::getDescribe(tensor)->type == DataType_DT_INT8) {
+        bytes = 1;
     }
     return bytes;
 }
@@ -163,7 +195,7 @@ Backend::MemObj* CUDABackend::onAcquire(const Tensor* nativeTensor, StorageType 
     auto bytes = getBytes(nativeTensor);
     size_t mallocSize = realSize(nativeTensor) * bytes;
 
-    std::pair<void*, int> buffer;
+    MemChunk buffer;
     if (storageType == DYNAMIC_SEPERATE) {
         buffer                              = mBufferPool->alloc(mallocSize, true);
         allocator = mBufferPool.get();
@@ -178,7 +210,7 @@ Backend::MemObj* CUDABackend::onAcquire(const Tensor* nativeTensor, StorageType 
     if(nullptr == buffer.first) {
         return nullptr;
     };
-    auto host = (uint8_t*)buffer.first + buffer.second;
+    auto host = buffer.ptr();
     ((Tensor*)nativeTensor)->buffer().device = (uint64_t)host;
     auto des = TensorUtils::getDescribe(nativeTensor);
     des->extra.offset = buffer.second;
@@ -195,6 +227,9 @@ size_t CUDABackend::realSize(const Tensor* tensor) {
     int pack = 1;
     if (dim == MNN_DATA_FORMAT_NC4HW4) {
         pack = PACK_NUMBER;
+        if (getDataType(tensor) == DataType_DT_INT8 || tensor->getType().bytes() == 1) {
+            pack = INT8_PACK_NUMBER;
+        }
     }
     size_t res = 1;
     for (int i = 0; i < tensor->dimensions(); ++i) {
@@ -207,41 +242,95 @@ size_t CUDABackend::realSize(const Tensor* tensor) {
     return res;
 }
 
+static OpType _getRealOpType(OpType opType) {
+    switch (opType) {
+        case OpType_Convolution:
+            return OpType_ConvInt8;
+        case OpType_ConvolutionDepthwise:
+            return OpType_DepthwiseConvInt8;
+        case OpType_BinaryOp:
+        default:
+            return opType;
+    }
+}
+
+#ifdef MNN_CODEGEN_CUDA
+void CUDABackend::compile(CUmodule* dst, std::pair<string, string> code, std::vector<const char*> compile_params) {
+    std::vector<const char *> param;
+    auto ptx_code =
+        CUDANVRTCCompile(code, param, mCUDARuntime->compute_capability(), false);
+
+    MNN_CUDA_SAFE_CALL(cuModuleLoadDataEx(dst, ptx_code.c_str(), 0, 0, 0));
+}
+#endif
+
 Execution* CUDABackend::onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                  const MNN::Op* op) {
 // #ifdef LOG_VERBOSE
     // MNN_PRINT("Start CUDABackend::onCreate useFp16:%d\n", useFp16());
 // #endif
+    auto opType = op->type();
+    if (outputs.size() > 0) {
+        if (TensorUtils::getDescribe(outputs[0])->quantAttr != nullptr && TensorUtils::getDescribe(outputs[0])->type == DataType_DT_INT8) {
+            opType = _getRealOpType(opType);
+        }
+    }
+    // MNN_PRINT("CUDABackend support type %s\n", EnumNameOpType(opType));
     auto creators = gCreator();
-    auto iter     = creators->find(op->type());
+    auto iter     = creators->find(opType);
     if (iter == creators->end()) {
         if (nullptr != op->name()) {
-            MNN_PRINT("CUDABackend Don't support type %s, %s\n", EnumNameOpType(op->type()), op->name()->c_str());
+            MNN_PRINT("CUDABackend Don't support type %s, %s\n", EnumNameOpType(opType), op->name()->c_str());
         } else {
-            MNN_PRINT("CUDABackend Don't support type %s\n", EnumNameOpType(op->type()));
+            MNN_PRINT("CUDABackend Don't support type %s\n", EnumNameOpType(opType));
         }
         return NULL;
     }
 
+    #ifdef MNN_CODEGEN_CUDA
+    if(op->type() == OpType_Extra) {
+        if (!FuseExecutionV2::check(op)) {
+            auto extra = op->main_as_Extra();
+            std::string source(reinterpret_cast<const char*>(extra->info()->data()));
+            auto kernel_name = extra->type()->c_str();
+            std::string kernel_source = source;
+
+            std::pair<std::string, std::string> kernelInfo = std::make_pair<std::string, std::string>(kernel_name, kernel_source.c_str());
+            if(mKernelCuModuleMap.find(kernelInfo) == mKernelCuModuleMap.end()) {
+                // printf("\n%s\n\n%s !!!!\n", kernel_source.c_str(), kernel_name);
+                std::vector<const char *> param;
+                bool includeHeadFile = mUseFp16AsFp32;
+                auto ptx_code =
+                    CUDANVRTCCompile(kernelInfo, param, mCUDARuntime->compute_capability(), includeHeadFile);
+                
+                MNN_CUDA_SAFE_CALL(cuModuleLoadDataEx(&mCuModule, ptx_code.c_str(), 0, 0, 0));
+                mKernelCuModuleMap.insert(std::pair<std::pair<std::string, std:: string>, CUmodule>(kernelInfo, mCuModule));
+            }
+        }
+    }
+    #endif
+
     auto exe = iter->second->onCreate(inputs, outputs, op, this);
     if (NULL == exe) {
         if (nullptr != op->name()) {
-            MNN_PRINT("CUDABackend The Creator Don't support type %s, %s\n", EnumNameOpType(op->type()), op->name()->c_str());
+            MNN_PRINT("CUDABackend The Creator Don't support type %s, %s\n", EnumNameOpType(opType), op->name()->c_str());
         } else {
-            MNN_PRINT("CUDABackend The Creator Don't support type %s\n", EnumNameOpType(op->type()));
+            MNN_PRINT("CUDABackend The Creator Don't support type %s\n", EnumNameOpType(opType));
         }
         return NULL;
     }
 #ifdef LOG_VERBOSE
     MNN_PRINT("End CUDABackend::onCreate \n");
 #endif
+
     return exe;
 }
 
 void CUDABackend::onResizeBegin() {
 }
 
-void CUDABackend::onResizeEnd() {
+ErrorCode CUDABackend::onResizeEnd() {
+    return NO_ERROR;
 }
 
 void CUDABackend::onExecuteBegin() const {
@@ -276,7 +365,10 @@ static void _computeBCA(int& batch, int& plane, int& channel, MNN_DATA_FORMAT sr
 
     if (srcDimensionFormat != MNN_DATA_FORMAT_NHWC) {
         batch = srcTensor->length(0);
-        channel = srcTensor->length(1);
+        channel = 1;
+        if(srcTensor->dimensions() > 1) {
+            channel = srcTensor->length(1);
+        }
         plane = 1;
         for (int i=2; i<srcTensor->dimensions(); ++i) {
             plane *= srcTensor->length(i);
@@ -316,17 +408,18 @@ void CUDABackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor)
     auto dstDimensionFormat = TensorUtils::getDescribe(dstTensor)->dimensionFormat;
     auto srcIndex = TensorUtils::getDescribe(srcTensor)->index;
     auto dstIndex = TensorUtils::getDescribe(dstTensor)->index;
-    auto srcDevice          = srcTensor->deviceId() != 0;
-    auto dstDevice          = dstTensor->deviceId() != 0;
+    auto srcDevice = (srcTensor->deviceId() != 0 && srcTensor->deviceId() != 1);
+    auto dstDevice = (dstTensor->deviceId() != 0 && dstTensor->deviceId() != 1);    
     MNN_ASSERT(srcDevice || dstDevice);
     uint8_t* srcPtr = nullptr;
-    std::pair<void*, int> tempSrcStorage;
+    MemChunk tempSrcStorage;
     auto bytes = getBytes(srcTensor);
     auto type = srcTensor->getType();
 
-    //printf("%d-%d\n", srcTensor->dimensions(), dstTensor->dimensions());
-    bool directCopy = (srcDimensionFormat == dstDimensionFormat && dstDimensionFormat != MNN_DATA_FORMAT_NC4HW4) || srcTensor->dimensions() <= 1;
-    if (mUseFp16AsFp32) {
+    //MNN_PRINT("%d-%d\n", srcTensor->dimensions(), dstTensor->dimensions());
+    bool directCopy = ((srcDimensionFormat == dstDimensionFormat && dstDimensionFormat != MNN_DATA_FORMAT_NC4HW4) || srcTensor->dimensions() <= 1) && \
+        (getDataType(srcTensor) == getDataType(dstTensor));
+    if (mPrecision == 2 || mPrecision == 3) { // Fp16 or Bf16
         if (((!srcDevice) || (!dstDevice))){
             if (type.code == halide_type_float) {
                 directCopy = false;
@@ -342,14 +435,14 @@ void CUDABackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor)
     for (int i=0; i<srcTensor->dimensions(); ++i) {
         MNN_PRINT("%d ", srcTensor->length(i));
         if(srcDevice && !dstDevice) {
-            printf("\n");
+            MNN_PRINT("\n");
         }
     }
     MNN_PRINT("], ");
     MNN_PRINT("addr:%p %p\n", srcTensor->deviceId(), dstTensor->deviceId());
 #endif
 
-
+    // printf("MNN srcDevice:%d %llu, dstDevice:%d %llu, directCopy:%d\n", srcDevice, srcTensor->deviceId(), dstDevice, dstTensor->deviceId(), directCopy);
     if (directCopy) {
         auto gpuSize = realSize(srcTensor) * getBytes(srcTensor);
         if (srcDevice && dstDevice) {
@@ -373,18 +466,18 @@ void CUDABackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor)
     if (!srcDevice) {
         auto cpuSize = srcTensor->size();
         tempSrcStorage = mStaticBufferPool->alloc(cpuSize);
-        srcPtr = (uint8_t*)tempSrcStorage.first + tempSrcStorage.second;
+        srcPtr = tempSrcStorage.ptr();
         mCUDARuntime->memcpy(srcPtr, srcTensor->host<void>(), cpuSize, MNNMemcpyHostToDevice,
                              true);
     } else {
         srcPtr = (uint8_t*)srcTensor->deviceId();
     }
     uint8_t* dstPtr = nullptr;
-    std::pair<void*, int> tempDstStorage;
+    MemChunk tempDstStorage;
     if (!dstDevice) {
         auto cpuSize = dstTensor->size();
         tempDstStorage = mStaticBufferPool->alloc(cpuSize);
-        dstPtr = (uint8_t*)tempDstStorage.first + tempDstStorage.second;
+        dstPtr = tempDstStorage.ptr();
     } else {
         dstPtr = (uint8_t*)dstTensor->deviceId();
     }
@@ -398,10 +491,60 @@ void CUDABackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor)
     //     MNN_PRINT("%d ", srcTensor->length(i));
     // }
     // MNN_PRINT("\n, batch:%d, plane:%d, channel:%d, dims:%d\n", batch, plane, channel, srcTensor->dimensions());
+    // MNN_PRINT("oncopybuffer dateType:%d->%d  format:%d->%d\n", getDataType(srcTensor), getDataType(dstTensor), srcDimensionFormat, dstDimensionFormat);
+
+    std::unique_ptr<Tensor> wrapTensor;
+    MemChunk wrapSrcStorage;
+    if (getDataType(srcTensor) != getDataType(dstTensor)) {
+        auto dimType = Tensor::CAFFE;
+        switch (TensorUtils::getDescribe(srcTensor)->dimensionFormat) {
+            case MNN_DATA_FORMAT_NCHW:
+                break;
+            case MNN_DATA_FORMAT_NC4HW4:
+                dimType = Tensor::CAFFE_C4;
+                break;
+            case MNN_DATA_FORMAT_NHWC:
+                dimType = Tensor::TENSORFLOW;
+                break;
+            default:
+                break;
+        }
+
+        auto convertType = CastCreator::FlOAT_TO_INT8;
+        if (getDataType(srcTensor) == DataType_DT_INT8) {
+            convertType = CastCreator::INT8_TO_FlOAT;
+        }
+
+        wrapTensor.reset(Tensor::createDevice(srcTensor->shape(), dstTensor->getType(), dimType));
+        wrapSrcStorage = mStaticBufferPool->alloc(realSize(wrapTensor.get()) * getBytes(dstTensor));
+        // MNN_PRINT("warp:%d %d %d %d\n", realSize(wrapTensor.get()), getBytes(dstTensor), dstTensor->getType(), srcTensor->getDimensionType());
+        wrapTensor.get()->buffer().device = (uint64_t)(wrapSrcStorage.ptr());
+
+        auto dstType = getDataType(dstTensor);
+        if (dstType != DataType_DT_FLOAT) {
+            wrapTensor->setType(dstType);
+        }
+
+#ifdef LOG_VERBOSE
+        MNN_PRINT("CPU backend copy tensor ptr:%p -> ptr:%p hostPtr:%p -> %p, format %d -> %d, dims: [",
+        srcTensor, dstTensor, srcTensor->host<void>(), dstTensor->host<void>(), TensorUtils::getDescribe(srcTensor)->dimensionFormat, TensorUtils::getDescribe(dstTensor)->dimensionFormat);
+        for (int i=0; i<srcTensor->dimensions(); ++i) {
+            MNN_PRINT("%d ", srcTensor->length(i));
+        }
+        MNN_PRINT("]\n");
+#endif
+
+        auto code = CastCreator::cast(srcTensor, wrapTensor.get(), (Backend*)this, convertType);
+        if (NO_ERROR != code) {
+            MNN_ERROR("Error in CudaBackend::onCopyBuffer:cast\n");
+        }
+        srcTensor = wrapTensor.get();
+        srcPtr = (uint8_t*)srcTensor->deviceId();
+    }
 
     FormatConvert((float *)dstPtr, (float *)srcPtr, srcDimensionFormat, dstDimensionFormat, mCUDARuntime.get(), \
             plane, batch, channel, srcTensor, \
-            mUseFp16AsFp32, srcDevice, dstDevice);
+            mPrecision, srcDevice, dstDevice);
 
     if (!srcDevice) {
         mStaticBufferPool->free(tempSrcStorage);
@@ -414,6 +557,28 @@ void CUDABackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor)
     }
     NVTX_POP();
     return;
+}
+
+int CUDABackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) {
+    if (toCpu) {
+        mCUDARuntime->device_sync();
+    }
+    return 0;
+}
+
+DataType CUDABackend::getDataType(const Tensor* tensor) {
+    auto des = TensorUtils::getDescribe(tensor);
+    if (nullptr == des->quantAttr.get()) {
+        return DataType_DT_FLOAT;
+    }
+    return des->type;
+}
+
+ErrorCode CastWrapExecution::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
+    auto convertType = mRunType == DataType_DT_INT8 ? CastCreator::FlOAT_TO_INT8 : CastCreator::INT8_TO_FlOAT;
+    auto cudaBackend = ((CUDABackend*)backend());
+    CastCreator::cast(inputs[0], outputs[0], cudaBackend, convertType);
+    return NO_ERROR;
 }
 
 bool CUDABackend::addCreator(OpType t, Creator* c) {

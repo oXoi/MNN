@@ -108,11 +108,14 @@ public:
         Dimensionformat order = NHWC;
         INTS dim;
         halide_type_t type;
-        int size;
+        size_t size;
         void syncSize();
     };
     const std::string& name() const;
     void setName(const std::string& name);
+    bool setDevicePtr(const void* devicePtr, int memoryType);
+    bool copyToDevicePtr(void* devicePtr, int memoryType);
+
     std::pair<EXPRP, int> expr() const {
         return std::make_pair(mFrom, mFromIndex);
     }
@@ -127,6 +130,10 @@ public:
     template <typename T>
     T* writeMap() {
         return (T*)writeInternal();
+    }
+
+    void writeScaleMap(float scaleValue, float zeroPoint) {
+        writeScaleInternal(scaleValue, zeroPoint);
     }
 
     //Depecerate
@@ -170,6 +177,7 @@ private:
     void* readInternal(bool forShape = false);
     void* writeInternal(bool inform=true);
     void informDirty();
+    void writeScaleInternal(float scaleValue, float zeroPoint, bool inform = true);
 
     friend class Expr;
     EXPRP mFrom;
@@ -262,6 +270,7 @@ private:
     bool mVisited                   = false;
     std::vector<WeakEXPRP> mTo;
     bool mCanDecompose = true;
+    friend class ExprModule;
 
 };
 } // namespace Express

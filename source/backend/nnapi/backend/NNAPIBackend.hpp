@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <map>
 #include <memory>
+#include <MNN/ErrorCode.hpp>
 #include <core/Backend.hpp>
 #include <core/Execution.hpp>
 #include <core/TensorUtils.hpp>
@@ -20,12 +21,36 @@
 #include "NNAPISymbol.hpp"
 
 namespace MNN {
+    static void dumpTensor(const Tensor* t) {
+        printf("Tensor Dump %p : {\n", t);
+        t->printShape();
+        const char* dtype = "";
+        if (t->getType() == halide_type_of<float>()) {
+            dtype = "float32";
+        } else if (t->getType() == halide_type_of<int8_t>()) {
+            dtype = "int8_t";
+        }
+        printf("\t**Tensor dtype**: %s,\n", dtype);
+        const char* format = "";
+        if (TensorUtils::getDescribe(t)->dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
+            format = "NC4HW4";
+        } else if (TensorUtils::getDescribe(t)->dimensionFormat == MNN_DATA_FORMAT_NCHW) {
+            format = "NCHW";
+        } else if (TensorUtils::getDescribe(t)->dimensionFormat == MNN_DATA_FORMAT_NHWC) {
+            format = "NHWC";
+        }
+        printf("\t**Tensor format**: %s,\n", format);
+        if (TensorUtils::getDescribe(t)->quantAttr.get()) {
+            printf("\t**Tensor quant**: %f, %f\n", TensorUtils::getDescribe(t)->quantAttr->scale, TensorUtils::getDescribe(t)->quantAttr->zero);
+        }
+        printf("}\n");
+    }
     class NNAPIRuntime : public Runtime {
     public:
         NNAPIRuntime(const Backend::Info& info);
         virtual ~NNAPIRuntime();
         virtual CompilerType onGetCompilerType() const override;
-        virtual Backend* onCreate(const BackendConfig* conf) const override;
+        virtual Backend* onCreate(const BackendConfig* conf, Backend* origin) const override;
         virtual void onGabageCollect(int level) override;
         virtual std::pair<const void*, size_t> onGetCache() override {
             return std::make_pair(mCacheBuffer, mCacheSize);
@@ -56,7 +81,7 @@ namespace MNN {
         virtual void onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const override;
 
         virtual void onResizeBegin() override;
-        virtual void onResizeEnd() override;
+        virtual ErrorCode onResizeEnd() override;
 
     public:
         class Creator {
@@ -85,14 +110,16 @@ namespace MNN {
                 }
             }
         }
-        uint32_t getTensorIdx(const Tensor* t);
+        uint32_t getTensorIdx(const Tensor* t, bool dequant = false);
         uint32_t buildScalar(int scalar);
         uint32_t buildScalar(bool scalar);
         uint32_t buildScalar(float scalar);
-        uint32_t buildOperand(const void* data, size_t size, OperandCode code, std::vector<uint32_t> dims = {});
+        uint32_t buildOperand(const void* data, size_t size, OperandCode code, std::vector<uint32_t> dims = {}, const float* scales = nullptr, int zero = 0);
         ErrorCode buildOperation(int op, const std::vector<uint32_t> &inputs, const std::vector<uint32_t> &outputs, const char* name = nullptr);
+        ErrorCode buildQuantOperation(const Tensor* src, const Tensor* dst);
         ErrorCode replaceTensorWith(const Tensor* src, const Tensor* replace);
-        void buildModel();
+        uint32_t buildDequantOperand(const Tensor* t);
+        ErrorCode buildModel();
         void invokeModel() const;
     private:
         bool mNCHW = false;
@@ -102,7 +129,9 @@ namespace MNN {
         std::vector<std::unique_ptr<Tensor>> mInputContentTensors, mOutputContentTensors;
         std::vector<const Tensor*> mInputTensors, mOutputTensors;
         // tensor idx map
-        std::map<const Tensor*, uint32_t> mTensorIdxMap, mInputIdxMap, mOutputIdxMap;
+        std::map<const Tensor*, uint32_t> mTensorIdxMap, mInputIdxMap, mOutputIdxMap, mDequantIdxMap;
+        std::map<uint32_t, const Tensor*> mDequantMap;
+        std::map<uint32_t, uint32_t> mQuantCacheMap;
         uint32_t mTensorIdx = 0;
         std::vector<const char*> mOpNames;
         // scalar idx map

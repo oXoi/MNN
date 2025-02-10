@@ -15,6 +15,7 @@ namespace MNN {
 namespace Train {
 
 bool TurnTrainable::onExecute(const std::vector<VARP>& outputs, std::shared_ptr<Parameters> p) {
+    auto& trainInfo = mTrainInfo.bnVariables;
     auto exprs = Variable::getExecuteOrder(outputs);
     {
         auto isTraining = _Input({}, NCHW, halide_type_of<int>());
@@ -27,7 +28,7 @@ bool TurnTrainable::onExecute(const std::vector<VARP>& outputs, std::shared_ptr<
         trainInfo["bn_momentum"] = _Scalar<float>(mConfig.extraParams["BatchNorm"]["momentum"]->f);
         // Turn convolution be trainable convolution
         for (auto expr : exprs) {
-            auto newExpr = OpConverter::convert(expr, trainInfo);
+            auto newExpr = OpConverter::convert(expr, mTrainInfo);
             if (newExpr.get() != expr.get()) {
                 Expr::replace(expr, newExpr);
             }
@@ -66,12 +67,15 @@ bool TurnTrainable::onExecute(const std::vector<VARP>& outputs, std::shared_ptr<
             
             auto va = Variable::create(v, 0);
             if (update && name != "") {
-                MNN_PRINT("Add Variable: %s\n", name.c_str());
                 va.fix(VARP::TRAINABLE);
                 if (name.find("Weight") == std::string::npos && name.find("Bias") == std::string::npos) {
                     MNN_PRINT(">>>\ncheck mnn model if const '%s' is a learnable parameter in your original training model, ", name.c_str());
                     MNN_PRINT("if not, add it to transformConfig.json NoUpdateOps\n<<<\n");
+                    va->setName(name + "_Weight");
+                    va->expr().first->setName(va->name());
                 }
+                mTrainInfo.trainables.insert(std::make_pair(name, va->name()));
+                MNN_PRINT("Add Variable: %s\n", va->name().c_str());
             } else {
                 va.fix(VARP::CONSTANT);
             }

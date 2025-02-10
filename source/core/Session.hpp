@@ -31,13 +31,23 @@ public:
         Interpreter::SessionMode outputMode = Interpreter::Session_Output_Inside;
         Interpreter::SessionMode backendMode = Interpreter::Session_Backend_Fix;
         Interpreter::SessionMode resizeMode = Interpreter::Session_Resize_Direct;
+        Interpreter::SessionMode memoryUsageMode = Interpreter::Session_Memory_Collect;
+        Interpreter::SessionMode codegenMode = Interpreter::Session_Codegen_Disable;
         int maxTuningNumber = MNN_DEFAULT_TUNING_NUMBER;
+        int geometryMask = 0xFFFF;
+        bool checkNetBuffer = true;
+        RuntimeHint runtimeHint;
+        void setHint(Interpreter::HintMode hint, int magic);
+        void setMode(Interpreter::SessionMode mode);
+        void setExternalPath(std::string path, int type);
     };
     Session(Schedule::ScheduleInfo&& info, const ModeGroup& mode,
             RuntimeInfo&& runtime);
     ~Session();
 
     Session* clone(RuntimeInfo&& runtime, std::shared_ptr<Schedule::ScheduleInfo> sharedConst);
+    static void createPipelineBackend(Schedule::PipelineInfo& iter, RuntimeInfo& runtime);
+
 public:
     /**
      * @brief infer.
@@ -56,6 +66,8 @@ public:
 
     bool getInfo(Interpreter::SessionInfoCode code, void* ptr) const;
 
+    void openResizeCheck();
+    ErrorCode fixResizeCache();
 public:
     /**
      * @brief resize tensors and buffers responding to input changes.
@@ -135,7 +147,6 @@ protected:
     }
 
 private:
-    void _clearCache();
     void _setUpTensorInfo(const Schedule::ScheduleInfo& info);
 
 private:
@@ -145,6 +156,8 @@ private:
     bool mValid      = true;
     bool mNeedMalloc = true;
     Interpreter::SessionMode mCallBackMode;
+    Interpreter::SessionMode mMemoryUsageMode;
+    Interpreter::SessionMode mCodegenMode;
     Schedule::ScheduleInfo mInfo;
     ModeGroup mMode;
 };

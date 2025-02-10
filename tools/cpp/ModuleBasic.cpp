@@ -8,15 +8,17 @@
 
 #include "MNN_generated.h"
 #include <MNN/expr/Expr.hpp>
+#include <MNN/expr/ExecutorScope.hpp>
 #include <MNN/expr/Module.hpp>
 #include <MNN/expr/ExprCreator.hpp>
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include "rapidjson/document.h"
-#include "common/MemoryFormater.h"
-#include <fstream>
-#include <sstream>
-#include <cmath>
+#include "core/MemoryFormater.h"
+#include <numeric>
+#include <chrono>
+#include <iostream>
+#include <thread>
 #include "ExprDebug.hpp"
 
 using namespace MNN::Express;
@@ -58,14 +60,18 @@ static bool compareOutput(VARP output, const std::string& directName, const std:
         MNN_PRINT("%d, ", info->dim[i]);
     }
     MNN_PRINT(")\n");
-    auto targetValue = _Input({info->dim}, info->order, info->type);
+    auto targetValue = _Input(info->dim, info->order, info->type);
     auto targetPtr = targetValue->writeMap<float>();
     auto outputPtr = output->readMap<float>();
 #define MNN_IS_INF(x) (fabs(x) == INFINITY)
 #define MNN_IS_NAN(x) ((x) != (x))
+    for (int i=0; i<info->size; ++i) {
+        double targetValue;
+        outputOrigin >> targetValue;
+        targetPtr[i] = targetValue;
+    }
 
     for (int i=0; i<info->size; ++i) {
-        outputOrigin >> targetPtr[i];
         if (MNN_IS_INF(outputPtr[i]) || MNN_IS_NAN(outputPtr[i])) {
             MNN_ERROR("TESTERROR %s value error:%f\n", name.c_str(), outputPtr[i]);
             return false;
@@ -77,6 +83,7 @@ static bool compareOutput(VARP output, const std::string& directName, const std:
     auto diffAbsMax = _ReduceMax(diff);
     auto absMaxV = absMax->readMap<float>()[0];
     auto diffAbsMaxV = diffAbsMax->readMap<float>()[0];
+    MNN_PRINT("For %s, max = %f, diffmax = %f, diff rate = %f\n", name.c_str(), absMaxV, diffAbsMaxV, diffAbsMaxV / fmaxf(absMaxV, 1e-6));
     if (absMaxV * 0.01f < diffAbsMaxV || MNN_IS_NAN(absMaxV)) {
         MNN_ERROR("TESTERROR %s value error : absMaxV:%f - DiffMax %f\n", name.c_str(), absMaxV, diffAbsMaxV);
         return false;
@@ -85,13 +92,16 @@ static bool compareOutput(VARP output, const std::string& directName, const std:
 }
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        MNN_ERROR("Usage: ./ModuleBasic.out ${test.mnn} ${Dir} [runMask] [forwardType] [runLoops] [numberThread] [precision] [cacheFile]\n");
+        MNN_ERROR("Usage: ./ModuleBasic.out ${test.mnn} ${Dir} [runMask] [forwardType] [runLoops] [numberThread] [precision | memory] [cacheFile]\n");
         return 0;
     }
+    BackendConfig backendConfigTmp;
+    auto _executor = Executor::newExecutor(MNN_FORWARD_CPU, backendConfigTmp, 1);
+    ExecutorScope _s(_executor);
+
     std::string modelName = argv[1];
     std::string directName = argv[2];
     MNN_PRINT("Test %s from input info: %s\n", modelName.c_str(), directName.c_str());
-    rapidjson::Document document;
     std::map<std::string, float> inputInfo;
     std::map<std::string, std::vector<int>> inputShape;
     std::vector<std::string> inputNames;
@@ -103,10 +113,34 @@ int main(int argc, char *argv[]) {
         if (runMask & 1) {
             _initDebug();
         }
+        if (runMask & 2) {
+            _initTensorStatic();
+        }
     }
     int repeatNumber = 1;
     bool shapeMutable = true;
-    {
+    std::vector<VARP> inputs;
+    std::vector<VARP> outputs;
+    if (runMask & 128) {
+        MNN_PRINT("Use input.mnn and output.mnn for test\n");
+        inputs = MNN::Express::Variable::load((directName + "/input.mnn").c_str());
+        outputs = MNN::Express::Variable::load((directName + "/output.mnn").c_str());
+        if (inputs.size() > 0 && outputs.size() > 0) {
+            MNN_PRINT("Has input.mnn, use input.mnn and output.mnn instead of json\n");
+        }
+        for (auto v : inputs) {
+            inputNames.emplace_back(v->name());
+        }
+        for (auto v : outputs) {
+            outputNames.emplace_back(v->name());
+        }
+        checkOutput = outputs.size() > 0;
+    }
+    // Call Time / Per Second
+    float freq = 0.0f;
+    int cpuDecreaseRate = -1;
+    if (inputNames.empty()) {
+        rapidjson::Document document;
         std::ostringstream jsonNameOs;
         jsonNameOs << directName << "/input.json";
         std::ifstream fileNames(jsonNameOs.str().c_str());
@@ -154,6 +188,12 @@ int main(int argc, char *argv[]) {
         if (document.HasMember("repeat")) {
             repeatNumber = document["repeat"].GetInt();
         }
+        if (document.HasMember("freq")) {
+            freq = document["freq"].GetFloat();
+        }
+        if (document.HasMember("cpu_decrease_rate")) {
+            cpuDecreaseRate = document["cpu_decrease_rate"].GetInt();
+        }
     }
     auto type = MNN_FORWARD_CPU;
     if (argc > 4) {
@@ -167,15 +207,22 @@ int main(int argc, char *argv[]) {
         modeNum = ::atoi(argv[6]);
     }
 
+    int power = BackendConfig::Power_Normal;
     int precision = BackendConfig::Precision_Normal;
+    int memory = BackendConfig::Memory_Normal;
     if (argc > 7) {
-        precision = atoi(argv[7]);
+        int mask = atoi(argv[7]);
+        precision = mask % 4;
+        memory = (mask / 4) % 4;
+        power = (mask / 16) % 4;
     }
     const char* cacheFileName = ".tempcache";
     if (argc > 8) {
         cacheFileName = argv[8];
     }
     FUNC_PRINT(precision);
+    FUNC_PRINT(memory);
+    FUNC_PRINT(power);
     FUNC_PRINT_ALL(cacheFileName, s);
     // create session
     MNN::ScheduleConfig config;
@@ -186,16 +233,38 @@ int main(int argc, char *argv[]) {
     config.backupType = type;
     BackendConfig backendConfig;
     // config.path.outputs.push_back("ResizeBilinear_2");
-    // backendConfig.power = BackendConfig::Power_High;
+    backendConfig.power = (BackendConfig::PowerMode)power;
     backendConfig.precision = static_cast<MNN::BackendConfig::PrecisionMode>(precision);
-    // backendConfig.memory = BackendConfig::Memory_High;
+    backendConfig.memory = static_cast<MNN::BackendConfig::MemoryMode>(memory);
     config.backendConfig     = &backendConfig;
 
     MNN::Express::Module::Config mConfig;
+    if (runMask & 256) {
+        mConfig.dynamic = true;
+    }
     mConfig.shapeMutable = shapeMutable;
     std::shared_ptr<Executor::RuntimeManager> rtmgr(Executor::RuntimeManager::createRuntimeManager(config));
     rtmgr->setCache(cacheFileName);
+    if (cpuDecreaseRate > 0 && cpuDecreaseRate <= 100) {
+        rtmgr->setHint(Interpreter::CPU_LITTLECORE_DECREASE_RATE, cpuDecreaseRate);
+    }
     if (runMask & 1) {
+        // Need dump tensor, open debug
+        rtmgr->setMode(Interpreter::Session_Debug);
+    }
+    if (runMask & 2) {
+        // Need tensor static for each op, open debug
+        rtmgr->setMode(Interpreter::Session_Debug);
+    }
+    // For Debug
+    if (false) {
+        int geometryMask = Interpreter::GeometryComputeMask::GEOMETRCOMPUTEMASK_ALL;
+        geometryMask -= Interpreter::GeometryComputeMask::GEOMETRCOMPUTEMASK_FUSEREGION;
+        geometryMask -= Interpreter::GeometryComputeMask::GEOMETRCOMPUTEMASK_OPENCACHE;
+        rtmgr->setHint(Interpreter::GEOMETRY_COMPUTE_MASK, geometryMask);
+    }
+    if (runMask & 4) {
+        // Need time trace for each op, open debug
         rtmgr->setMode(Interpreter::Session_Debug);
     }
     if (runMask & 8) {
@@ -207,6 +276,12 @@ int main(int argc, char *argv[]) {
     }
     if (runMask & 32) {
         mConfig.rearrange = true;
+    }
+    if (runMask & 512) {
+        rtmgr->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
+    }
+    if (runMask & 2048) {
+        rtmgr->setExternalPath("tmp", Interpreter::EXTERNAL_FEATUREMAP_DIR);
     }
     std::shared_ptr<Module> net;
     {
@@ -238,36 +313,46 @@ int main(int argc, char *argv[]) {
             continue;\
         }\
         for (int i=0; i<info->size; ++i) {\
-            inputOs >> ptr[i];\
+            double tempValue;\
+            inputOs >> tempValue;\
+            ptr[i] = tempValue;\
         }\
     }
 
+    if (inputs.empty()) {
+        inputs.resize(mInfo->inputs.size());
+        for (int i=0; i<inputs.size(); ++i) {
+            inputs[i] = _Input(mInfo->inputs[i].dim, mInfo->inputs[i].order, mInfo->inputs[i].type);
+        }
+        // Load inputs
+        for (int i=0; i<inputs.size(); ++i) {
+            auto inputName = inputNames[i];
+            // Resize
+            auto shapeIter = inputShape.find(inputName);
+            auto order = mInfo->inputs[i].order;
+            if (MNN::Express::Dimensionformat::NC4HW4 == mInfo->inputs[i].order) {
+                order = MNN::Express::Dimensionformat::NCHW;
+            }
 
-    std::vector<VARP> inputs(mInfo->inputs.size());
-    for (int i=0; i<inputs.size(); ++i) {
-        inputs[i] = _Input(mInfo->inputs[i].dim, mInfo->inputs[i].order, mInfo->inputs[i].type);
-    }
-    // Load inputs
-    for (int i=0; i<inputs.size(); ++i) {
-        auto inputName = inputNames[i];
-        // Resize
-        auto shapeIter = inputShape.find(inputName);
-        if (shapeIter != inputShape.end()) {
-            auto s = shapeIter->second;
-            inputs[i] = _Input(s, mInfo->defaultFormat, mInfo->inputs[i].type);
+            if (shapeIter != inputShape.end()) {
+                auto s = shapeIter->second;
+                inputs[i] = _Input(s, order, mInfo->inputs[i].type);
+            }
+            auto info = inputs[i]->getInfo();
+            if (info->type == halide_type_of<float>()){
+                auto ptr = inputs[i]->writeMap<float>();
+                LOAD_DATA(float)
+            } else {
+                auto floatVar = _Input(info->dim, info->order, halide_type_of<float>());
+                auto ptr = floatVar->writeMap<float>();
+                LOAD_DATA(float)
+                auto temp = _Cast(floatVar, info->type);
+                inputs[i]->input(temp);
+            }
+            if (MNN::Express::Dimensionformat::NC4HW4 == mInfo->inputs[i].order) {
+                inputs[i] = _Convert(inputs[i], MNN::Express::Dimensionformat::NC4HW4);
+            }
         }
-        auto info = inputs[i]->getInfo();
-        if (info->type == halide_type_of<float>()){
-            auto ptr = inputs[i]->writeMap<float>();
-            LOAD_DATA(float)
-        } else {
-            auto floatVar = _Input(info->dim, info->order, halide_type_of<float>());
-            auto ptr = floatVar->writeMap<float>();
-            LOAD_DATA(float)
-            auto temp = _Cast(floatVar, info->type);
-            inputs[i]->input(temp);
-        }
-        inputs[i] = _Convert(inputs[i], mInfo->inputs[i].order);
     }
 #undef LOAD_DATA
 
@@ -341,12 +426,43 @@ int main(int argc, char *argv[]) {
     if (runTime > 0) {
         int t = runTime;
         std::vector<float> times(t, 0.0f);
-
+        if (runMask & 4) {
+            _initTimeTrace();
+        }
         for (int i = 0; i < t; ++i) {
             Timer _l;
             auto out = net->onForward(inputs);
+            Variable::compute(out);
+            for (auto o : out) {
+                ((MNN::Tensor*)o->getTensor())->wait(MNN::Tensor::MAP_TENSOR_READ, true);
+            }
             times[i] = _l.durationInUs() / 1000.0f;
-
+            if (freq > 0.0f) {
+                float remainMs = (1000.0f / freq) - times[i];
+                if (remainMs > 0.0f) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds((int)remainMs));
+                }
+            }
+        }
+        if (nullptr != gTimeTraceInfo) {
+            float opSummer = 0.0f;
+            float opFlopsSummber = 0.0f;
+            for (auto& iter : gTimeTraceInfo->mTypes) {
+                float summer = 0.0f;
+                float summerflops = 0.0f;
+                for (auto& t : iter.second) {
+                    for (auto& t0 : t.second) {
+                        summer += t0.first;
+                        summerflops += t0.second;
+                    }
+                }
+                summer = summer / (float)t;
+                summerflops = summerflops / (float)t;
+                MNN_PRINT("%s : %.7f, FLOP: %.7f, Speed: %.7f GFlops\n", iter.first.c_str(), summer, summerflops, summerflops / summer);
+                opSummer += summer;
+                opFlopsSummber+= summerflops;
+            }
+            MNN_PRINT("OP Summer: %.7f, Flops: %.7f, Speed: %.7f GFlops\n", opSummer, opFlopsSummber, opFlopsSummber/opSummer);
         }
         auto minTime = std::min_element(times.begin(), times.end());
         auto maxTime = std::max_element(times.begin(), times.end());

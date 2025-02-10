@@ -15,7 +15,7 @@
 #include "core/TensorUtils.hpp"
 #include "math/WingoradGenerater.hpp"
 #include <MNN/AutoTime.hpp>
-#include "common/MemoryFormater.h"
+#include "core/MemoryFormater.h"
 #ifdef MNN_USE_NEON
 #include <arm_neon.h>
 #endif
@@ -328,7 +328,7 @@ ErrorCode ConvolutionPackFreeWinograd::onExecute(const std::vector<Tensor *> &in
                         auto _dstFloatPtr = (float*)(_dstOrigin + i * dc_4 * pack * xC * bytes);
                         auto _weightFloatPtr = (const float*)(weight + i * mResource->mWeight->stride(0));
                         auto gemmBufferPtr = (const float*)(gemmBuffer + i * ePack * ic_roundup * bytes);
-                        core->MNNPackedMatMul(_dstFloatPtr, (float*)gemmBufferPtr, _weightFloatPtr, parameters.data(), nullptr, nullptr);
+                        core->MNNPackedMatMul(_dstFloatPtr, (float*)gemmBufferPtr, _weightFloatPtr, parameters.data(), nullptr, nullptr, nullptr, nullptr);
                     }
                 } else {
                     for (int i = tId; i < srcUnit2; i+=threadNumber) {
@@ -340,7 +340,7 @@ ErrorCode ConvolutionPackFreeWinograd::onExecute(const std::vector<Tensor *> &in
                         auto _dstFloatPtr = (float*)(_dstOrigin + i * dc_4 * pack * xC * bytes);
                         auto _weightFloatPtr = (const float*)(weight + i * mResource->mWeight->stride(0));
                         auto gemmBufferPtr = (const float*)(gemmBuffer + i * ePack * ic_roundup * bytes);
-                        core->MNNPackedMatMulRemain(_dstFloatPtr, (float*)gemmBufferPtr, _weightFloatPtr, xC, parametersRemain.data(), nullptr, nullptr);
+                        core->MNNPackedMatMulRemain(_dstFloatPtr, (float*)gemmBufferPtr, _weightFloatPtr, xC, parametersRemain.data(), nullptr, nullptr, nullptr, nullptr);
                     }
                 }
             };
@@ -645,6 +645,11 @@ WinogradConfig ConvolutionPackFreeWinograd::updateBestWinogradUnit(const Convolu
     auto oc4 = UP_DIV(oc, pack);
     int ePackMax, hPack, lPack;
     core->MNNGetMatMulPackMode(&ePackMax, &lPack, &hPack);
+    auto winogradMemoryLevel = static_cast<CPUBackend*>(b)->getRuntime()->hint().winogradMemoryUsed;
+    int unitMaxLimit = CONVOLUTION_WINOGRAD_MAX_UNIT;
+    if (winogradMemoryLevel != 3) {
+        unitMaxLimit = CONVOLUTION_WINOGRAD_MIN_UNIT;
+    }
 
     WinogradConfig bestConfig(0, false, 0, 0, 0, std::numeric_limits<float>().max());
     auto kernelSize  = common->kernelY();
@@ -659,7 +664,7 @@ WinogradConfig ConvolutionPackFreeWinograd::updateBestWinogradUnit(const Convolu
     for (int ePack = ePackUnit; ePack <= ePackUnit; ePack += ePackUnit) {
         int unit2   = UP_DIV(batch * ow * oh, ePack);
         int maxUnit = (int)::sqrtf((float)unit2);
-        maxUnit     = std::min(maxUnit, CONVOLUTION_WINOGRAD_MAX_UNIT);
+        maxUnit     = std::min(maxUnit, unitMaxLimit);
         maxUnit     = std::max(maxUnit, CONVOLUTION_WINOGRAD_MIN_UNIT);
         std::set<int> supportSu{4, 6, 8};
 

@@ -17,7 +17,7 @@ public:
     virtual ~VulkanDeconvolution() {
     }
 
-    static VulkanDeconvolution* create(Backend* bn, const Convolution2D* conv, OpType type, bool multiInputs);
+    static VulkanDeconvolution* create(Backend* bn, const Op* op, OpType type, bool multiInputs);
     virtual ErrorCode onEncode(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                const VulkanCommandPool::Buffer* cmdBuffer) override;
 
@@ -27,7 +27,7 @@ private:
     std::shared_ptr<Tensor> mKernel;
 
     const VulkanPipeline* mPipeline;
-    std::shared_ptr<VulkanPipeline::DescriptorSet> mPipelineSet;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mPipelineSet;
 
     const Convolution2DCommon* mConvCommonOption;
     std::shared_ptr<VulkanBuffer> mConvParam;

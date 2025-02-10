@@ -1,5 +1,5 @@
 # 测试工具
-[从源码编译](../compile/tools.html#id4)使用cmake编译时，build目录下的产物也包含测试使用的工具集，下面逐项说明。
+使用cmake编译时，默认打开 MNN_BUILD_TOOLS 编译宏，对应build目录下的产物也包含测试使用的工具集，下面逐项说明。
 
 ## GetMNNInfo
 ### 功能
@@ -26,14 +26,16 @@ Model Version: < 2.0.0
 测试性能、输出结果，可检查与Caffe/Tensorflow的预期结果是否匹配。
 **注意：对非CPU后端来说，只有总耗时是准确的，单个op耗时和op耗时占比都是不准确的**
 ### 参数
-`./MNNV2Basic.out model [runLoops runMask forwardType numberThread inputSize precision]`
+`./MNNV2Basic.out model [runLoops runMask forwardType numberThread precision_memory inputSize]`
 - `model:str` 模型文件路径
 - `runLoops:int` 性能测试的循环次数，可选，默认为`1`
-- `runMask:int` 是否输出推理中间结果，0为不输出，1为只输出每个算子的输出结果（{op_name}.txt），2为输出每个算子的输入（Input_{op_name}.txt）和输出（{op_name}.txt）结果； 默认输出当前目录的output目录下（使用工具之前要自己建好output目录），可选，默认为`0`
+- `runMask:int` 是否输出推理中间结果，0为不输出，1为只输出每个算子的输出结果（{op_name}.txt）;2为输出每个算子的输入（Input_{op_name}.txt）和输出（{op_name}.txt）结果； 默认输出当前目录的output目录下（使用工具之前要自己建好output目录）; 16为开启自动选择后端；32为针对Winograd算法开启内存优化模式，开启后会降低模型（如果含有Winograd Convolution算子）运行时的内存但可能会导致算子的性能损失。可选，默认为`0`
 - `forwardType:int` 执行推理的计算设备，有效值为：0（CPU）、1（Metal）、2（CUDA）、3（OpenCL）、6（OpenGL），7(Vulkan) ，9 (TensorRT)，可选，默认为`0`
 - `numberThread:int` 线程数仅对CPU有效，可选，默认为`4`
+- `precision_memory:int` 测试精度与内存模式，precision_memory % 4 为精度，有效输入为：0(Normal), 1(High), 2(Low), 3(Low_BF16)，可选，默认为`2` ; (precision_memory / 4) % 4 为内存设置，默认为 0 (memory_normal) 。例如测试 memory 为 low (2) ，precision 为 1 (high) 时，设置 precision_memory = 9 (2 * 4 + 1)
 - `inputSize:str` 输入tensor的大小，输入格式为：`1x3x224x224`，可选，默认使用模型默认输入
-- `precision:int` 测试精度，有效输入为：0(Normal), 1(High), 2(Low), 3(Low_BF16)，可选，默认为`2`
+
+
 ### 默认输入与输出
 只支持单一输入、单一输出。输入为运行目录下的input_0.txt；输出为推理完成后的第一个输出tensor，转换为文本后，输出到output.txt中。
 ### 示例
@@ -62,21 +64,43 @@ Avg= 5.570600 ms, OpSum = 7.059200 ms min= 3.863000 ms, max= 11.596001 ms
 
 ## ModuleBasic.out
 ### 功能
-类似`MNNV2Basic.out`，对于带控制流模型，或者多输入多输出的模型，建议采用这个工具
+类似`MNNV2Basic.out`，对于带控制流模型，或者多输入多输出的模型，必须采用这个工具
 ### 参数
-`./ModuleBasic.out model dir [runMask forwardType runLoops numberThread precision cacheFile]`
+`./ModuleBasic.out model dir [runMask forwardType runLoops numberThread precision_memory cacheFile]`
 - `model:str` 模型文件路径
-- `dir:str` 输入输出信息文件夹，可使用 fastTestOnnx.py / fastTestTf.py / fastTestTflite.py 等脚本生成，参考模型转换的正确性校验部分。
-- `runMask:int` 是否输出推理中间结果，0为不输出，1为只输出每个算子的输出结果（{op_name}.txt），2为输出每个算子的输入（Input_{op_name}.txt）和输出（{op_name}.txt）结果； 默认输出当前目录的output目录下（使用工具之前要自己建好output目录），可选，默认为`0`
+- `dir:str` 输入输出信息文件夹，可使用 testMNNFromTf.py / testMNNFromOnnx.py / testMNNFromTflite.py 等脚本生成，参考模型转换的正确性校验部分。
+- `runMask:int` 默认为 0 ，为一系列功能的开关，如需开启多个功能，可把对齐的 mask 值相加（不能叠加的情况另行说明），具体见下面的 runMask 参数解析
 - `forwardType:int` 执行推理的计算设备，有效值为：0（CPU）、1（Metal）、2（CUDA）、3（OpenCL）、6（OpenGL），7(Vulkan) ，9 (TensorRT)，可选，默认为`0`
 - `runLoops:int` 性能测试的循环次数，可选，默认为`0`即不做性能测试
 - `numberThread:int` GPU的线程数，可选，默认为`1`
-- `precision:int` 测试精度，有效输入为：0(Normal), 1(High), 2(Low), 3(Low_BF16)，可选，默认为`0`
+- `precision_memory_power:int` 测试精度与内存模式，precision_memory_power % 4 为精度，有效输入为：0(Normal), 1(High), 2(Low), 3(Low_BF16)，可选，默认为`0` ; (precision_memory_power / 4 % 4) 为内存设置，默认为 0 (memory_normal) ; (precision_memory_power / 16 % 4) 为功耗设置，默认为 0 (power_normal)。例如测试 memory 为 2(low) ，precision 为 1 (high) ，power 为 0(normal) 时，设置 precision_memory = 9 (2 * 4 + 1 + 0 * 16)
+
+
 ### 默认输出
 在当前目录 output 文件夹下，依次打印输出为 0.txt , 1.txt , 2.txt , etc
+
+### 测试文件夹生成
+- 若有原始的tf模型/Onnx模型，可以使用testMNNFromTf.py / testMNNFromOnnx.py / testMNNFromTflite.py 等脚本生成
+- 若只有mnn模型，可以用 tools/script/make_test_for_mnn.py 脚本生成测试文件夹，使用方式：mkdir testdir && pythhon3 make_test_for_mnn.py XXX.mnn testdir
+- 为了方便模拟应用中的运行性能，可以通过修改测试文件夹下的 input.json ，增加 freq 项，以指定该模型运行的频率（每秒多少次）
+
+### runMask 参数说明
+- 1 : 输出推理中间结果，每个算子的输入存到（Input_{op_name}.txt），输出存为（{op_name}.txt）， 默认输出当前目录的output目录下（使用工具之前要自己建好output目录），不支持与 2 / 4 叠加
+- 2 : 打印推理中间结果的统计值（最大值/最小值/平均值），只支持浮点类型的统计，不支持与 1 / 4 叠加
+- 4 : 统计推理过程中各算子耗时，不支持与 1 / 2 叠加，仅在 runLoops 大于 0 时生效
+- 8 : shapeMutable 设为 false （默认为 true）
+- 16 : 适用于使用 GPU 的情况，由 MNN 优先选择 CPU 运行，并将 GPU 的 tuning 信息存到 cache 文件，所有算子 tuning 完成则启用 GPU
+- 32 : rearrange 设为 true ，降低模型加载后的内存大小，但会增加模型加载的初始化时间
+- 64 : 创建模型后，clone 出一个新的模型运行，用于测试 clone 功能（主要用于多并发推理）的正确性
+- 128 : 使用文件夹下面的 input.mnn 和 output.mnn 做为输入和对比输出，对于数据量较大的情况宜用此方案
+- 512 : 开启使用Winograd算法计算卷积时的内存优化，开启后模型的运行时内存会降低，但可能导致性能损失。
+- 1024: 使用动态量化推理时，对输入数据分batch量化以提高模型的推理精度
+- 2048: 使用mmap方式，使用文件存储中间内存。存储文件的目录为当前目录/tmp，需要先建tmp文件夹
+
+
 ### 示例
 ```bash
-$ python ../tools/script/fastTestOnnx.py mobilenetv2-7.onnx
+$ python ../tools/script/testMNNFromOnnx.py mobilenetv2-7.onnx
 $ ./ModuleBasic.out mobilenetv2-7.mnn onnx 0 0 10   
 Test mobilenetv2-7.mnn from input info: onnx
 input
@@ -98,8 +122,8 @@ Avg= 9.946699 ms, min= 9.472000 ms, max= 10.227000 ms
 `./SequenceModuleTest.out model [forwardType] [shapeMutable] dir1 dir2 ......`
 - `model:str` 模型文件路径
 - `forwardType:int` 执行推理的计算设备，有效值为：0（CPU）、1（Metal）、2（CUDA）、3（OpenCL）、6（OpenGL），7(Vulkan) ，9 (TensorRT)
-- `shapeMutable:int` 输入形状是否可变
-- `dir_n:str` 输入输出信息文件夹，可使用 fastTestOnnx.py / fastTestTf.py / fastTestTflite.py 等脚本生成，参考模型转换的正确性校验部分
+- `numberThread:int` 线程数或GPU模式
+- `dir_n:str` 输入输出信息文件夹，可使用 testMNNFromOnnx.py 等脚本生成，参考模型转换的正确性校验部分
 ```bash
 ./SequenceModuleTest.out transformer.mnn 0 1 tr tr1 tr2 tr3 tr4 > error.txt
 ```
@@ -239,19 +263,10 @@ stopOp.c_str()=s  in main, 278
 Correct ! Run second pass
 Correct !
 ```
-### 在Android中使用
-先编译相关的库和可执行文件，然后push到Android手机上，用adb执行命令，参考`project/android/testCommon.sh`
-```bash
-cd project/android
-mkdir build_64
-cd build_64 && ../build_64.sh
-../updateTest.sh
-../testCommon.sh ./backendTest.out temp.mnn 3 0.15 1
-```
 
 ## getPerformance
 ### 功能
-获取当前设备的CPU性能，打印出每个CPU核心的频率；在Android设备上还会打印该设备CPU的浮点计算能力(GFLOPS)
+获取当前设备的CPU性能和内存访问性能，打印出每个CPU核心的频率；在Android设备上还会打印该设备CPU的浮点计算能力(GFLOPS)
 
 *各核心频率仅在Linux/Android环境中有效，计算能力仅在Android中有效*
 ### 参数
@@ -354,11 +369,11 @@ Testing model mobilenet.mnn, input: input.mnn, output: output.mnn
 Correct!
 ```
 
-## testModelWithDescrisbe.out
+## testModelWithDescribe.out
 ### 功能
 功能与`testModel.out`相同，输入输出通过配置文件来描述，支持多输入与多输出的对比，同时支持指定输入形状
 ### 参数
-`./testModelWithDescrisbe.out model confg`
+`./testModelWithDescribe.out model confg`
 - `model:str` 模型文件路径
 - `confg:str` 配置文件路径，配置文件如下：
     ```
@@ -373,7 +388,7 @@ Correct!
     ```
 ### 示例
 ```bash
-./testModelWithDescrisbe.out mobilenet.mnn config.txt
+./testModelWithDescribe.out mobilenet.mnn config.txt
 model dir: mobilenet.mnn
 Testing Model ====> mobilenet.mnn
 First Time Pass
@@ -441,49 +456,47 @@ Matrix:
 0.0000000	0.0000000	1.0000000
 ```
 
-## winogradGenerateCL.out
-### 说明
-生成winograd变换矩阵程序，并生成opencl转换代码
+## fuseTest
+### 功能
+测试 GPU 自定义算子的功能，目前仅支持 Vulkan Buffer 模式
+
 ### 参数
-`./winogradExample.out unit kernelSize`
-- `unit:int` 分块大小
-- `kernelSize:int` 卷积核大小
+`Usage: ./fuseTest user.spirv config.json`
+- `user.spirv:str`：SPIRV文件路径，可以用 glslangValidator -V user.comp -o user.spirv 编译获得
+- `config.json:str`: 配置文件路径
 ### 示例
 ```bash
-$ ./winogradGenerateCL.out 2 2
-A
-1.0000000	0.0000000	
-1.0000000	0.5000000	
-0.0000000	1.0000000	
-B
-1.0000000	0.0000000	-0.0000000	
--2.0000000	2.0000000	-0.5000000	
-0.0000000	0.0000000	1.0000000	
-G
-1.0000000	0.0000000	
-1.0000000	0.5000000	
-0.0000000	1.0000000	
-Generate winogradTransformSource2_2_0.5.cl
-Generate winogradTransformDest2_2_0.5.cl
+$ ./fuseTest user.spirv user.json
 ```
 
-## winogradGenerateGLSL.out
-### 说明
-生成winograd变换矩阵程序，并生成opengl转换代码
+## GpuInterTest.out
+### 功能
+GPU 内存输入测试用例
 ### 参数
-`./winogradExample.out unit kernelSize`
-- `unit:int` 分块大小
-- `kernelSize:int` 卷积核大小
-### 示例
+类似`ModuleBasic.out` 
+`./GpuInterTest.out model dir [testmode forwardType numberThread precision_memory]`
+- `model:str` 模型文件路径
+- `dir:str` 输入输出信息文件夹，可使用 testMNNFromTf.py / testMNNFromOnnx.py / testMNNFromTflite.py 等脚本生成，参考模型转换的正确性校验部分。
+- `testmode:int` 默认为 0 ，测试输入GPU内存的类型，0 (OpenCL Buffer) 、 1（OpenGL Texture）
+- `forwardType:int` 执行推理的计算设备，有效值为：0（CPU）、1（Metal）、2（CUDA）、3（OpenCL）、6（OpenGL），7(Vulkan) ，9 (TensorRT)，可选，默认为`0`
+- `numberThread:int` GPU的线程数，可选，默认为`1`
+- `precision_memory:int` 测试精度与内存模式，precision_memory % 4 为精度，有效输入为：0(Normal), 1(High), 2(Low), 3(Low_BF16)，可选，默认为`0` ; (precision_memory / 4) % 4 为内存设置，默认为 0 (memory_normal) 。 (precision_memory / 16） % 4 为功耗设置，默认为0（power_normal）。例如测试 memory 为 2(low) ，precision 为 1 (high) 时，设置 precision_memory = 9 (2 * 4 + 1)
+
+
+## 在Android中使用测试工具
+- project/android/updateTest.sh 可以把编译好的库和可执行文件 push 到Android手机的/data/local/tmp/MNN 目录
+- project/android/testCommon.sh 可以在 /data/local/tmp/MNN 目录下执行可执行程序
+
+其他的资源文件需要自行使用 adb push ，将其放到手机的 /data/local/tmp/MNN 目录下，比如 adb push temp.mnn /data/local/tmp/MNN/temp.mnn
+
+如下例子是在Android设备上使用 backendTest.out ，其中 temp.mnn 路径为 /data/local/tmp/MNN/temp.mnn
+
 ```bash
-$ ./winogradGenerateGLSL.out 1 2
-A
-1.0000000	
-B
-1.0000000	-0.0000000	
-0.0000000	1.0000000	
-G
-1.0000000	
-Generate winogradTransformSource1_2_0.5.comp
-Generate winogradTransformDest1_2_0.5.comp
+cd project/android
+mkdir build_64
+cd build_64 && ../build_64.sh
+../updateTest.sh
+../testCommon.sh ./backendTest.out temp.mnn 3 0.15 1
 ```
+
+
