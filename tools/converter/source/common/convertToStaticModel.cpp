@@ -10,6 +10,7 @@
 #include <sstream>
 #include "MNN_generated.h"
 #include "core/TensorUtils.hpp"
+#include "core/FileLoader.hpp"
 #include "utils/InitNet.hpp"
 #include "core/Command.hpp"
 #include "shape/SizeComputer.hpp"
@@ -24,11 +25,10 @@ using namespace MNN;
 if (tensor->getType() == halide_type_of<type##_t>()) {\
 blob->dataType = DataType_DT_##TYPE;
 
-#define CONSTANT_COPY(TYPE, type) \
+#define CONSTANT_COPY(TYPE, type, bytes) \
 SET_TYPE(TYPE, type)\
-for (int i = 0; i < tensor->elementSize(); i++) {\
-blob->type##s.push_back(tensor->host<type##_t>()[i]);\
-}\
+blob->type##s.resize(tensor->elementSize());\
+::memcpy(blob->type##s.data(), tensor->host<type##_t>(), blob->type##s.size() * bytes);\
 }
 
 static bool _RemoveDupOutput(MNN::NetT* net, bool abortOpt) {
@@ -115,7 +115,7 @@ static void _RemoveUnusefulNodes(std::unique_ptr<MNN::NetT>& net) {
     MNN::Express::ExecutorScope::Current()->setLazyComputeMode(originMode);
 }
 
-void genStaticModel(CommandBuffer buffer, const std::string& modelName, std::map<Tensor*, std::pair<std::string, int>>& tensorNames, std::vector<std::string>&& outputNames, const Net* originNetInfo) {
+static void genStaticModel(CommandBuffer buffer, const std::string& modelName, std::map<Tensor*, std::pair<std::string, int>>& tensorNames, std::vector<std::string>&& outputNames, const Net* originNetInfo) {
     MNN_PRINT("gen Static Model ... \n");
     std::unique_ptr<MNN::NetT> netT = std::unique_ptr<MNN::NetT>(new MNN::NetT());
     netT->outputName = std::move(outputNames);
@@ -185,9 +185,13 @@ void genStaticModel(CommandBuffer buffer, const std::string& modelName, std::map
         auto index = tensorPair.second;
         //FUNC_PRINT(index);
         auto des = TensorUtils::getDescribe(tensor);
-        if (des->usage == Tensor::InsideDescribe::CONSTANT) {
+        if (des->usage == Tensor::InsideDescribe::CONSTANT || des->usage == MNN::Tensor::InsideDescribe::TRAINABLE) {
             std::unique_ptr<OpT> op(new OpT);
-            op->type = OpType_Const;
+            if (des->usage == Tensor::InsideDescribe::CONSTANT) {
+                op->type = OpType_Const;
+            } else {
+                op->type = OpType_TrainableParam;
+            }
             auto blob = new BlobT;
             op->main.type = OpParameter_Blob;
             op->main.value = blob;
@@ -197,14 +201,13 @@ void genStaticModel(CommandBuffer buffer, const std::string& modelName, std::map
             }
             if (tensor->getType() == halide_type_of<float>()) {
                 blob->dataType = DataType_DT_FLOAT;
-                for (int i = 0; i < tensor->elementSize(); i++) {
-                    blob->float32s.push_back(tensor->host<float>()[i]);
-                }
+                blob->float32s.resize(tensor->elementSize());
+                ::memcpy(blob->float32s.data(), tensor->host<void>(), blob->float32s.size() * sizeof(float));
             } else {
-                CONSTANT_COPY(INT8, int8);
-                CONSTANT_COPY(UINT8, uint8);
-                CONSTANT_COPY(INT32, int32)
-                CONSTANT_COPY(INT64, int64);
+                CONSTANT_COPY(INT8, int8, 1);
+                CONSTANT_COPY(UINT8, uint8, 1);
+                CONSTANT_COPY(INT32, int32, 4)
+                CONSTANT_COPY(INT64, int64, 8);
             }
             op->outputIndexes.push_back(index);
             netT->oplists.emplace_back(std::move(op));
@@ -310,7 +313,7 @@ void converToStaticModel(const Net* net, std::map<std::string,std::vector<int>>&
     std::vector<std::shared_ptr<Tensor>> allTensors;
     allTensors.resize(net->tensorName()->size());
     ErrorCode code = NO_ERROR;
-    initConstTensors(allTensors, net, defaultBackend.get(), code);
+    initConstTensors(allTensors, net, defaultBackend.get(), code, nullptr);
     if (NO_ERROR != code) {
         MNN_ERROR("Init tensor error code = %d\n", code);
         return;
@@ -329,11 +332,11 @@ void converToStaticModel(const Net* net, std::map<std::string,std::vector<int>>&
     }
     std::vector<Schedule::OpCacheInfo> infos;
     initPipelineInfosFromNet(infos, net, allTensors);
-    GeometryComputer::Context ctx(defaultBackend);
+    GeometryComputer::Context ctx(Interpreter::GeometryComputeMask::GEOMETRCOMPUTEMASK_ALL, defaultBackend);
     // resize the session's info and store to buffer
     std::vector<Tensor*> constTensors;
     GeometryComputerUtils::buildConstantTensors(infos);
-    GeometryComputerUtils::shapeComputeAndGeometryTransform(infos, ctx, defaultBackend, runtime->onGetCompilerType());
+    GeometryComputerUtils::shapeComputeAndGeometryTransform(runtime.get(), nullptr, infos, ctx, defaultBackend, runtime->onGetCompilerType());
     std::map<Tensor*, std::pair<std::string, int>> tensorName;
     for (int i = 0; i < net->tensorName()->size(); i++) {
         tensorName[allTensors[i].get()] = std::make_pair(net->tensorName()->GetAsString(i)->str(), i);
@@ -352,6 +355,10 @@ void converToStaticModel(const Net* net, std::map<std::string,std::vector<int>>&
     }
     CommandBuffer newBuffer;
     for (auto& info : infos) {
+        if (info.type == MNN::Schedule::CONSTANT) {
+            continue;
+        }
+        // TODO: Remove inside constant op in future
         auto& buf = info.executeBuffer;
         newBuffer.command.insert(newBuffer.command.end(), buf.command.begin(), buf.command.end());
         newBuffer.extras.insert(newBuffer.extras.end(), buf.extras.begin(), buf.extras.end());

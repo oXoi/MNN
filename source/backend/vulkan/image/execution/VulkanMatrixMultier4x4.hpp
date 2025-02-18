@@ -29,8 +29,8 @@ public:
     }
 
 private:
-    const VulkanPipeline* mPipeline;
-    std::shared_ptr<VulkanPipeline::DescriptorSet> mDescriptorSet;
+    SharedPtr<VulkanPipeline> mPipeline;
+    std::shared_ptr<VulkanLayout::DescriptorSet> mDescriptorSet;
     VulkanBackend* mBackend;
 
     std::shared_ptr<VulkanImage> mKernel;
@@ -46,6 +46,7 @@ private:
 
     int mOutputWidth  = 0;
     int mOutputHeight = 0;
+    std::vector<uint32_t> mLws;
 };
 } // namespace MNN
 

@@ -73,6 +73,10 @@ static std::string _getMidType(const Op* op) {
             
             SETTYPE(UnaryOpOperation_ROUND, "ROUND");
             SETTYPE(UnaryOpOperation_HARDSWISH, "HARDSWISH");
+            SETTYPE(UnaryOpOperation_GELU, "GELU");
+            // Since SPIR-V lacks a built-in erf (gauss error function) instruction and the existing shader implementation of GELU is essentially an approximation of erf, there is no need to add a new implementation of GELU_STANDARD.
+            SETTYPE(UnaryOpOperation_GELU_STANDARD, "GELU");
+            SETTYPE(UnaryOpOperation_SILU, "SILU");
         } while(false);
 #undef SETTYPE
     }
@@ -95,7 +99,7 @@ bool VulkanUnary::encoderSingle(const VulkanCommandPool::Buffer* cmdBuffer, cons
     paramOrigin->size[3] = size[0]; // width
     param->unmap();
     auto totalSize = size[0] * size[1] * size[2];
-    std::shared_ptr<VulkanPipeline::DescriptorSet> des(mUnaryPipeline->createSet());
+    std::shared_ptr<VulkanLayout::DescriptorSet> des(mUnaryPipeline->createSet());
     des->writeImage(dest->view(), vkbackend->getCommonSampler()->get(), VK_IMAGE_LAYOUT_GENERAL, 0);
     des->writeImage(source->view(), vkbackend->getCommonSampler()->get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1);
     des->writeBuffer(param->buffer(), 2, sizeof(Param), 0);

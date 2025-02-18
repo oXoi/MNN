@@ -11,6 +11,7 @@
 #include "VulkanConvolution.hpp"
 #include "VulkanConvolutionWinograd.hpp"
 #include "VulkanMatMul.hpp"
+#include "VulkanConvolution1x1.hpp"
 //#define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 namespace MNN {
@@ -196,8 +197,8 @@ private:
     std::shared_ptr<VulkanImage> mBias;
     std::shared_ptr<VulkanImage> mKernel;
     const Convolution2DCommon* mConvCommonOption;
-    std::vector<std::shared_ptr<VulkanPipeline::DescriptorSet>> mCol2ImSet;
-    std::vector<std::shared_ptr<VulkanPipeline::DescriptorSet>> mIm2ColSet;
+    std::vector<std::shared_ptr<VulkanLayout::DescriptorSet>> mCol2ImSet;
+    std::vector<std::shared_ptr<VulkanLayout::DescriptorSet>> mIm2ColSet;
     std::vector<std::shared_ptr<VulkanBuffer>> mConvParams;
     std::vector<std::shared_ptr<VulkanMatrixMultier4x4>> mMultilers;
     std::function<std::shared_ptr<VulkanMatrixMultier4x4>()> mMultiCreator;
@@ -219,6 +220,13 @@ VulkanBasicExecution* VulkanConvolutionImpl::create(VulkanBackend* backend, cons
     if (ALIGN_UP4(ci) * convOption->kernelX() * convOption->kernelY() > imageLimit) {
         return nullptr;
     }
+
+    if (convOption->kernelX() == 1 && convOption->kernelY() == 1 &&
+        convOption->strideX() == 1 && convOption->strideY() == 1 &&
+        inputs[0]->width() == output->width() && inputs[0]->height() == output->height()) {
+        return new VulkanConvolution1x1(backend, convOption, weightPtr, biasPtr, ci, co);
+    }
+
     return new VulkanConvolutionIm2Col(backend, convOption, weightPtr, biasPtr, ci, co);
 }
 

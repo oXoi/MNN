@@ -22,6 +22,9 @@ using namespace MNN::Express;
 #ifdef PYMNN_OPENCV_API
 #include "cv/cv.hpp"
 #endif
+#ifdef PYMNN_AUDIO_API
+#include "audio/audio.hpp"
+#endif
 #endif // PYMNN_EXPR_API
 
 #ifdef BUILD_OPTYPE
@@ -64,6 +67,13 @@ using RegularizationMethod = ParameterOptimizer::RegularizationMethod;
 #ifdef PYMNN_OPENCV_API
 #include "cv.h"
 #endif
+#ifdef PYMNN_AUDIO_API
+#include "audio.h"
+#endif
+#endif
+
+#ifdef PYMNN_LLM_API
+#include "llm.h"
 #endif
 
 #ifdef PYMNN_INTERNAL_SERVING
@@ -573,114 +583,6 @@ std::unordered_map<std::string, Session *> *sessionCacheMap() {
     return tlsData->sessionCacheMap;
 }
 
-namespace ec {
-    int getVectorByKey(PyObject* dict, const char *key, std::vector<std::string>& result){
-        PyObject *saveTensors = PyDict_GetItemString(dict, key);
-        int count = 0;
-        if (saveTensors) {
-            if (!PyTuple_Check(saveTensors)) {
-                PyErr_SetString(PyExc_Exception,
-                                "PyMNNInterpreter_createSession: saveTensors must be a tuple");
-                return -1;
-            }
-
-            size_t saveTensorsCount = PyTuple_Size(saveTensors);
-            for (size_t i = 0; i < saveTensorsCount; i++) {
-                PyObject *tensorNameItem = PyTuple_GetItem(saveTensors, i);
-                if (!checkString(tensorNameItem)) {
-                    PyErr_SetString(PyExc_Exception,
-                                    "PyMNNInterpreter_createSession: saveTensors's member must be string");
-                    return -1;
-                }
-
-
-                result.push_back(object2String(tensorNameItem));
-                count++;
-            }
-        }
-        return count;
-    }
-}
-
-static std::pair<bool, std::pair<ScheduleConfig, std::shared_ptr<BackendConfig>>> createScheduleConfig(PyObject* dict) {
-    std::pair<bool, std::pair<ScheduleConfig, std::shared_ptr<BackendConfig>>> result;
-    result.first = false;
-    auto& config = result.second.first;
-    auto& backendConfig = result.second.second;
-    backendConfig.reset(new BackendConfig);
-    config.backendConfig = backendConfig.get();
-
-    if (dict) {
-        PyObject *backend = PyDict_GetItemString(dict, "backend");
-        config.type = MNN_FORWARD_CPU;
-        if (backend && checkString(backend)) {
-            auto backend_name = object2String(backend);
-            // Avoid misusing backend not supported by the bridge and corresponding MNN library on python level,
-            // then user will ask for right version bridge library to us, same like MNN.expr.Backend.* python enum
-            std::unordered_map<std::string, MNNForwardType> backend_map = {
-                // Don't care whether MNN library support corresponding backend, all backend type are usable by user,
-                // which make MNN.whl setup.py easy
-                {"CPU", MNN_FORWARD_CPU},
-                {"OPENCL", MNN_FORWARD_OPENCL},
-                {"OPENGL", MNN_FORWARD_OPENGL},
-                {"VULKAN", MNN_FORWARD_VULKAN},
-                {"METAL", MNN_FORWARD_METAL},
-                {"TRT", MNN_FORWARD_USER_1},
-                {"CUDA", MNN_FORWARD_CUDA},
-                {"HIAI", MNN_FORWARD_USER_0},
-                {"AUTO", MNN_FORWARD_AUTO}
-            };
-            auto iter = backend_map.find(backend_name);
-            if (iter == backend_map.end()) {
-                // backend not support, issue on python level when development
-                PyErr_SetString(PyExc_Exception,
-                                "PyMNNInterpreter_createSession: backend not support");
-                return result;
-            }
-            config.type = iter->second;
-        } else if (backend && PyLong_Check(backend)) {
-            config.type = (MNNForwardType)PyLong_AsLong(backend); // {'backend': 1L} for example
-        }
-        PyObject *numThread = PyDict_GetItemString(dict, "numThread");
-        if (numThread) {
-            if (!PyLong_Check(numThread)) {
-                PyErr_SetString(PyExc_Exception,
-                                "PyMNNInterpreter_createSession: numThread must be a integer");
-                return result;
-            }
-            config.numThread = (int)PyLong_AsLong(numThread);
-        }
-
-        {
-            //precision
-            PyObject *obj = PyDict_GetItemString(dict, "precision");
-            if (obj) {
-                auto obj_name = object2String(obj);
-                if (!obj_name.compare("low")) {
-                    MNN_PRINT("MNN use low precision\n");
-                    backendConfig->precision = MNN::BackendConfig::Precision_Low;
-                }
-                if (!obj_name.compare("Low_BF16")) {
-                    MNN_PRINT("MNN use lowBF precision\n");
-                    backendConfig->precision = MNN::BackendConfig::Precision_Low_BF16;
-                }
-                if (!obj_name.compare("high")) {
-                    MNN_PRINT("MNN use high precision\n");
-                    backendConfig->precision = MNN::BackendConfig::Precision_High;
-                }
-            }
-        }
-
-        if (-1 == ec::getVectorByKey(dict, "saveTensors", config.saveTensors)
-            || -1 == ec::getVectorByKey(dict, "inputPaths", config.path.inputs)
-            || -1 == ec::getVectorByKey(dict, "outputPaths", config.path.outputs)){
-            return result;
-        }
-    }
-    result.first = true;
-    return result;
-}
-
 static void _runtime_capsule_deleter(PyObject *obj) {
     auto info = (RuntimeInfo*)PyCapsule_GetPointer(obj, NULL);
     if (info != nullptr) {
@@ -698,15 +600,20 @@ static PyObject* PyMNNInterpreter_createRuntime(PyObject* self, PyObject* args) 
         return Py_None;
     }
     // BackendConfig lifetime management
+    if(PySequence_Size(dicts) > MAX_CONFIG_SIZE) {
+        MNN_PRINT("Error: MNN support max ScheduleConfig size is %d\n", MAX_CONFIG_SIZE);
+        return Py_None;
+    }
     std::vector<ScheduleConfig> configs;
-    std::vector<std::shared_ptr<BackendConfig>> backend_configs_backup;
+    ScheduleConfig config[MAX_CONFIG_SIZE];
+    BackendConfig backendConfig[MAX_CONFIG_SIZE];
     for (auto i = 0; i < PySequence_Size(dicts); ++i) {
-        auto config = createScheduleConfig(PySequence_GetItem(dicts, i));
-        if (!config.first) {
+        config[i].backendConfig = &backendConfig[i];
+        bool ret = getScheduleConfig(PySequence_GetItem(dicts, i), config[i]);
+        if (!ret) {
             return Py_None;
         }
-        configs.push_back(config.second.first);
-        backend_configs_backup.push_back(config.second.second);
+        configs.push_back(config[i]);
     }
 
     auto info = new RuntimeInfo;
@@ -744,16 +651,19 @@ static PyObject* createSession(PyMNNInterpreter *self, PyObject* dict, PyObject 
         return (PyObject *)session;
     }
 
-    auto config = createScheduleConfig(dict);
-    if (!config.first) {
+    ScheduleConfig config;
+    BackendConfig backendConfig;
+    config.backendConfig = &backendConfig;
+    bool ret = getScheduleConfig(dict, config);
+    if (!ret) {
         return NULL;
     }
     Session* s;
     if (rtinfo_py == NULL) {
-        s = self->interpreter->createSession(config.second.first);
+        s = self->interpreter->createSession(config);
     } else {
         auto runtimeinfo = *(RuntimeInfo*)PyCapsule_GetPointer(rtinfo_py, NULL);
-        s = self->interpreter->createSession(config.second.first, runtimeinfo);
+        s = self->interpreter->createSession(config, runtimeinfo);
     }
     if (!s) {
         PyErr_SetString(PyExc_Exception,
@@ -893,7 +803,7 @@ static PyObject* PyMNNInterpreter_updateCacheFile(PyMNNInterpreter *self, PyObje
         return NULL;
     }
 
-    ErrorCode r = NO_ERROR;
+    ErrorCode r;
     r = self->interpreter->updateCacheFile(session->session, flag);
     return PyLong_FromLong(r);
 }
@@ -938,7 +848,7 @@ static PyObject* PyMNNInterpreter_runSession(PyMNNInterpreter *self, PyObject *a
                         "PyMNNInterpreter_runSession: First argument is not a MNN.Session instance");
         return NULL;
     }
-    ErrorCode r = NO_ERROR;
+    ErrorCode r;
     Py_BEGIN_ALLOW_THREADS
 
 #ifdef PYMNN_INTERNAL_SERVING
@@ -1041,7 +951,7 @@ static PyObject* PyMNNInterpreter_runSessionWithCallBack(PyMNNInterpreter *self,
         return ret;
     };
 
-    ErrorCode r = NO_ERROR;
+    ErrorCode r;
     //Py_BEGIN_ALLOW_THREADS
     r = self->interpreter->runSessionWithCallBack(session->session, begin, end);
     //Py_END_ALLOW_THREADS
@@ -1168,7 +1078,7 @@ static PyObject* PyMNNInterpreter_runSessionWithCallBackInfo(PyMNNInterpreter *s
         return ret;
     };
 
-    ErrorCode r = NO_ERROR;
+    ErrorCode r;
     //Py_BEGIN_ALLOW_THREADS
     r = self->interpreter->runSessionWithCallBackInfo(session->session, begin, end);
     //Py_END_ALLOW_THREADS
@@ -1683,7 +1593,8 @@ static PyObject* PyMNNTensor_repr(PyObject *self) {
 #ifdef PYMNN_NUMPY_USABLE
     auto content = PyMNNTensor_getNumpyData(((PyMNNTensor*)self), NULL);
 #else
-    auto content = PyMNNVar_read_as_tuple((PyMNNVar*)self, NULL);
+    // print shape of tensor
+    auto content = PyMNNTensor_getShape((PyMNNTensor*)self, NULL);
 #endif
     auto reprfunc = PyObject_GetAttrString(content, "__repr__");
     auto str = PyEval_CallObject(reprfunc, NULL);
@@ -1710,7 +1621,7 @@ static PyObject* PyMNNTensor_fromNumpy(PyMNNTensor *self, PyObject *args) {
             return NULL;
         }
         DType dtype = htype2dtype(self->tensor->getType());
-        int npy_type = PyArray_TYPE(data);
+        int npy_type = PyArray_TYPE((const PyArrayObject*)data);
         int itemsize = getitemsize(dtype, npy_type);
         PyArrayObject *data_cont= PyArray_GETCONTIGUOUS((PyArrayObject*)data);
         auto tmpBuffer = PyArray_DATA(data_cont);
@@ -2046,7 +1957,7 @@ static PyObject* PyMNNCVImageProcess_convert(PyMNNCVImageProcess *self, PyObject
 #ifdef PYMNN_NUMPY_USABLE
     else if(gNumpyValid && PyArray_Check(source)) {
         // Array Data
-        int npy_type = PyArray_TYPE(source);
+        int npy_type = PyArray_TYPE((const PyArrayObject*)source);
         if(npy_type != NPY_UINT8) {
             PyErr_SetString(PyExc_Exception,
                         "PyMNNCVImageProcess_convert: only numpy.uint8 is supported for numpy");
@@ -2257,7 +2168,7 @@ static PyObject* PyMNNCVMatrix_repr(PyObject *self) {
     ((PyMNNCVMatrix *)self)->matrix->get9(mat);
     char buffer [100];
     sprintf(buffer, "[[%f\t%f\t%f]\n [%f\t%f\t%f]\n [%f\t%f\t%f]]",
-            mat[0], mat[1], mat[2], mat[3], mat[4], mat[5], mat[5], mat[6], mat[7], mat[8]);
+            mat[0], mat[1], mat[2], mat[3], mat[4], mat[5], mat[6], mat[7], mat[8]);
     return toPyObj(buffer);
 }
 // type: 0 set; 1 pre; 2 post
@@ -2736,14 +2647,22 @@ PyMODINIT_FUNC MOD_INIT_FUNC(void) {
 
 #ifdef PYMNN_EXPR_API
     // for expr multi-thread
+#ifdef PYMNN_USE_ALINNPYTHON
+    // create different excutor for each thread when alinn python
     BackendConfig bnConfig;
     auto threadExecutor = Executor::newExecutor(MNN_FORWARD_CPU, bnConfig, 1);
     // close lazy evaluation in python for speed and memory
     threadExecutor->lazyEval = false;
-#if TARGET_OS_IPHONE
+    #if TARGET_OS_IPHONE
     tlsData->scope = new ExecutorScope(threadExecutor);
-#else
+    #else
     static thread_local ExecutorScope scope(threadExecutor);
+    #endif
+#else
+    // use the same excutor for each thread
+    auto exe = ExecutorScope::Current();
+    // close lazy evaluation in python for speed and memory
+    exe->lazyEval = false;
 #endif
     // _expr submodule
     auto expr_module = def_submodule(m, "_expr");
@@ -2801,6 +2720,29 @@ PyMODINIT_FUNC MOD_INIT_FUNC(void) {
         def_method(cv_module, &PyMNNCV_methods[i]);
     }
 #endif
+#ifdef PYMNN_AUDIO_API
+    // audio submodule
+    auto audio_module = def_submodule(m, "audio");
+    // add methods of audio
+    constexpr int audio_method_num = sizeof(PyMNNAUDIO_methods) / sizeof(PyMethodDef);
+    for (int i = 0; i < audio_method_num; i++) {
+        def_method(audio_module, &PyMNNAUDIO_methods[i]);
+    }
+#endif
+#endif
+#ifdef PYMNN_LLM_API
+    // llm submodule
+    auto llm_module = def_submodule(m, "llm");
+    if (PyType_Ready(&PyMNNLLM) < 0) {
+        PyErr_SetString(PyExc_Exception, "initMNN.llm: PyType_Ready PyMNNLLM failed");
+        ERROR_RETURN
+    }
+    PyModule_AddObject(llm_module, "LLM", (PyObject *)PyType_FindTLSType(&PyMNNLLM));
+    // add methods of llm
+    constexpr int llm_method_num = sizeof(PyMNNLLM_static_methods) / sizeof(PyMethodDef);
+    for (int i = 0; i < llm_method_num; i++) {
+        def_method(llm_module, &PyMNNLLM_static_methods[i]);
+    }
 #endif
 
 #if PY_MAJOR_VERSION >= 3

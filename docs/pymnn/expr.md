@@ -103,45 +103,6 @@ array([0., 1., 2., 3.], dtype=float32)
         [3., 4.]], dtype=float32)]
 ```
 ---
-### `load_as_dict(fileName)`
-从文件中加载模型，并将模型转换为计算图，以`dict`的形式返回计算图的所有节点名称和`Var`
-
-参数：
-- `fileName:str` 模型文件路径
-
-返回：加载的模型计算图，其`key`为`str`，`value`为`Var`
-
-返回类型：`dict`
-
-示例：
-
-```python
->>> vars = expr.load_as_dict('mobilenet_v1.mnn')
->>> vars.keys()
-dict_keys(['conv1', 'conv2_1/dw', 'conv2_1/sep', 'conv2_2/dw', 'conv2_2/sep', 'conv3_1/dw', 'conv3_1/sep', 'conv3_2/dw', 'conv3_2/sep', 'conv4_1/dw', 'conv4_1/sep', 'conv4_2/dw', 'conv4_2/sep', 'conv5_1/dw', 'conv5_1/sep', 'conv5_2/dw', 'conv5_2/sep', 'conv5_3/dw', 'conv5_3/sep', 'conv5_4/dw', 'conv5_4/sep', 'conv5_5/dw', 'conv5_5/sep', 'conv5_6/dw', 'conv5_6/sep', 'conv6/dw', 'conv6/sep', 'data', 'fc7', 'pool6', 'prob'])
-```
----
-### `get_inputs_and_outputs(allVariable)`
-获取`dict`形式计算图的输入输出节点，可以在使用V3接口时获取输入输出的信息
-
-参数：
-- `allVariable:dict` 计算图的`dict`形式，其`key`为`str`，`value`为`Var`
-
-返回：计算图的输入输出，其中输入输出都为`dict`形式，其`key`为`str`，`value`为`Var`
-
-返回类型：`(dict, dict)`
-
-示例：
-
-```python
->>> vars = expr.load_as_dict('mobilenet_v1.mnn')
->>> inputs, outputs = expr.get_inputs_and_outputs(vars)
->>> inputs.keys()
-dict_keys(['data'])
->>> outputs.keys()
-dict_keys(['prob'])
-```
----
 ### `gc(full)`
 手动回收内存，当在循环中调用MNN表达式求值时，常量部分数据不会在每次循环结束释放，当执行次数增加时会有内存增长现象，可以在每次循环结束时调用该函数回收常量内存
 
@@ -183,6 +144,108 @@ dict_keys(['prob'])
 >>> expr.placeholder().op_type
 'Input'
 ```
+---
+### `set_lazy_mode(mode)`
+设置惰性计算的模式，仅在开启惰性求值的状态下生效，
+
+- 0 : 所有计算均延迟执行
+- 1 : 立即进行几何计算，内容计算延迟执行，适用于构建静态模型或训练时求导
+
+默认为0
+
+
+参数：
+- `x:int` 模式类型
+
+返回：`None`
+
+返回类型：`None`
+
+示例：
+```python
+>>> expr.lazy_eval(True)
+>>> expr.set_lazy_mode(0)
+>>> y = expr.concat([x], -1)
+>>> expr.save([y], "concat.mnn") # 模型中为 concat 算子
+>>> expr.set_lazy_mode(1)
+>>> y = expr.concat([x], -1)
+>>> expr.save([y], "concat_static.mnn") # 模型中为 raster 算子
+```
+
+---
+### `set_global_executor_config(backend, precision, threadnum)`
+设置expr运行后端、精度、线程数(gpu代表mode)：
+
+参数：
+- `backend:int` 例如：0->CPU 1->Metal 2->CUDA 3->OPENCL 
+- `precision:int` 例如：0—>Normal 1->High 2->Low 
+- `threadnum:int` 例如：CPU表示线程数  GPU表示Mode
+
+返回：`None`
+
+返回类型：`None`
+
+示例：
+
+```python
+>>> expr.set_global_executor_config(2, 2, 1)
+```
+
+---
+### `sync()`
+MNN VARP同步，调用后可以保证改VARP计算完毕
+
+返回：`None`
+
+返回类型：`None`
+
+示例：
+
+```python
+>>> mnn_var = expr.placeholder([2,2])
+>>> mnn_var.sync()
+```
+
+---
+### `set_device_ptr(device_ptr, memory_type)`
+设置MNN VARP GPU内存地址，同时指定给定内存地址对应的内存类型(CUDA/OPENCL/OPENGL等)，仅在MNN VARP有GPU内存时可用：
+
+参数：
+- `device_ptr:uint64_t` 整形内存指针地址
+- `memory_type:int` 例如： 2->CUDA 3->OpenCL等, 详见include/MNN/MNNForwardType.h文件中MNNForwardType结构体
+
+返回：`None`
+
+返回类型：`None`
+
+示例：
+
+```python
+>>> torch_tensor = torch.empty([1, 1000], dtype=torch.float16).cuda()
+>>> mnn_var = expr.placeholder([2,2])
+>>> mnn_var.set_device_ptr(torch_tensor.data_ptr() ,2)
+```
+
+---
+### `copy_to_device_ptr(device_ptr, memory_type)`
+拷贝MNN VARP GPU内存到指定内存地址, 同时指定给定内存地址对应的内存类型(CUDA/OPENCL/OPENGL等)：
+
+参数：
+- `device_ptr:uint64_t` 整形内存指针地址
+- `memory_type:int` 例如： 2->CUDA 3->OpenCL等, 详见include/MNN/MNNForwardType.h文件中MNNForwardType结构体
+
+返回：`None`
+
+返回类型：`None`
+
+示例：
+
+```python
+>>> torch_tensor = torch.empty([1, 1000], dtype=torch.float16).cuda()
+>>> mnn_var = expr.placeholder([2,2])
+>>> mnn_var.copy_to_device_ptr(torch_tensor.data_ptr() ,2)
+```
+
 ---
 ### `sign(x)`
 返回输入值的符号，正数返回1，负数返回-1
@@ -2189,6 +2252,25 @@ array([[[[0., 1.]],
 ```
 
 ---
+### `reverse(x, axis)`
+在输入x变量在axis[0]维度进行翻转
+
+参数：
+- `x : var_like` 输入变量
+- `axis : var_like` 输入变量
+
+返回：反转序列的值
+
+返回类型：`Var`
+
+示例：
+
+```python
+>>> expr.reverse(expr.range(-4., 4., 1.), [0])
+array([ 3.,  2.,  1.,  0., -1., -2., -3., -4.], dtype=float32)
+```
+
+---
 ### `reverse_sequence(x, y, batch_dim, seq_dim)`
 沿着batch_dim维度对x进行切片并反转维度seq_dim上的y[i]元素
 
@@ -2923,6 +3005,52 @@ array([[1., 3.],
 ```
 
 ---
+### `quant(var, scale, min=-128, max=127, zero=0)`
+量化，根据`scale`把float类型的输入量化为int8类型的输出，量化公式为：`y = clamp(x / scale + zero, min, max)`
+
+参数：
+- `var : Var` 输入变量，dtype为`float`, data_format为`NC4HW4`
+- `scale : Var` 量化的scale值，dtype为`float`
+- `min : int` 输出变量的最小值，默认为-128
+- `max : int` 输出变量的最大值，默认为127
+- `zero : int` 零点值，默认为0
+
+返回：量化后的int8类型变量
+
+返回类型：`Var`
+
+示例：
+
+```python
+>>> x = expr.const([1., 2., 3. ,4.], [4])
+>>> x = expr.convert(x, expr.NC4HW4)
+>>> expr.quant(x, 0.2, -128, 127)
+array([-128, -128, -127, -127], dtype=int8)
+```
+
+---
+### `dequant(var, scale, zero=0)`
+反量化，根据`scale`把int8类型的输入反量化为float类型的输出，量化公式为：`y = (x - zero) * scale`
+
+参数：
+- `var : Var` 输入变量，dtype为int8
+- `scale : Var` 反量化的scale值，dtype为float
+- `zero : int` 反量化的zero值，默认为0
+
+返回：反量化后的float类型变量
+
+返回类型：`Var`
+
+示例：
+
+```python
+>>> x = expr.const([-128, -128, -127, -127], [4], NCHW, expr.int8)
+>>> x = expr.convert(x, expr.NC4HW4)
+>>> expr.dequant(x, 0.2, 0)
+array([0. , 0. , 0.2, 0.2], dtype=float32)
+```
+
+---
 ### `histogram(input, binNum, minVal, maxVal)`
 计算输入变量在指定范围内的直方图分布
 
@@ -2963,3 +3091,88 @@ SSD检测模型后处理函数
 返回：后处理结果
 
 返回类型：`Var`
+
+---
+### `roi_pooling(input, roi, pooledHeight, pooledWidth, spatialScale, outputGrad, backwardDiff)`
+roi_pooling
+
+参数：
+- `input : Var` 输入变量，dtype为int8
+- `roi : Var` 反量化的scale值，dtype为float
+- `pooledHeight : int` 反量化的zero值，默认为0
+- `pooledWidth : int` 反量化的zero值，默认为0
+
+返回：roipooling结果
+
+返回类型：`Var`
+
+示例：
+
+```python
+TODO
+```
+
+---
+### `roi_align(input, roi, pooledHeight, pooledWidth, spatialScale, samplingRatio, aligned, poolType, outputGrad, backwardDiff)`
+
+roialign
+
+参数：
+- `input : Var` 输入变量，dtype为int8
+- `roi : Var` 反量化的scale值，dtype为float
+- `pooledHeight : int` pooling的
+- `pooledHeight : int` 反量化的zero值，默认为0
+
+返回：roialign结果
+
+返回类型：`Var`
+
+示例：
+
+```python
+TODO
+```
+---
+**以下函数为框架开发者使用函数，普通用户不建议使用！**
+
+---
+### `load_as_dict(fileName)` *[deprecated]*
+从文件中加载模型，并将模型转换为计算图，以`dict`的形式返回计算图的所有节点名称和`Var`
+
+*不建议使用该接口*
+
+参数：
+- `fileName:str` 模型文件路径
+
+返回：加载的模型计算图，其`key`为`str`，`value`为`Var`
+
+返回类型：`dict`
+
+示例：
+
+```python
+>>> vars = expr.load_as_dict('mobilenet_v1.mnn')
+>>> vars.keys()
+dict_keys(['conv1', 'conv2_1/dw', 'conv2_1/sep', 'conv2_2/dw', 'conv2_2/sep', 'conv3_1/dw', 'conv3_1/sep', 'conv3_2/dw', 'conv3_2/sep', 'conv4_1/dw', 'conv4_1/sep', 'conv4_2/dw', 'conv4_2/sep', 'conv5_1/dw', 'conv5_1/sep', 'conv5_2/dw', 'conv5_2/sep', 'conv5_3/dw', 'conv5_3/sep', 'conv5_4/dw', 'conv5_4/sep', 'conv5_5/dw', 'conv5_5/sep', 'conv5_6/dw', 'conv5_6/sep', 'conv6/dw', 'conv6/sep', 'data', 'fc7', 'pool6', 'prob'])
+```
+---
+### `get_inputs_and_outputs(allVariable)` *[deprecated]*
+获取`dict`形式计算图的输入输出节点，可以在使用V3接口时获取输入输出的信息
+
+参数：
+- `allVariable:dict` 计算图的`dict`形式，其`key`为`str`，`value`为`Var`
+
+返回：计算图的输入输出，其中输入输出都为`dict`形式，其`key`为`str`，`value`为`Var`
+
+返回类型：`(dict, dict)`
+
+示例：
+
+```python
+>>> vars = expr.load_as_dict('mobilenet_v1.mnn')
+>>> inputs, outputs = expr.get_inputs_and_outputs(vars)
+>>> inputs.keys()
+dict_keys(['data'])
+>>> outputs.keys()
+dict_keys(['prob'])
+```

@@ -6,8 +6,10 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
+#include <MNN/expr/ExecutorScope.hpp>
 #include "NN.hpp"
 #include "Distributions.hpp"
+#include "module/ModuleInside.hpp"
 #include "module/PipelineModule.hpp"
 #include "module/WhileModule.hpp"
 #include "module/IfModule.hpp"
@@ -17,7 +19,7 @@
 #include "RandomGenerator.hpp"
 #include "core/Macro.h"
 #include "math/WingoradGenerater.hpp"
-#include "common/WinogradInt8Attr.hpp"
+#include "core/WinogradInt8Attr.hpp"
 #include <string>
 
 using namespace MNN::Express;
@@ -397,6 +399,11 @@ Module* NN::Linear(int l, int t, bool hasBias, std::shared_ptr<Initializer> weig
     }
     auto weight = weightInit->createConstVar({t, l}, NCHW);
     weight.fix(VARP::TRAINABLE);
+    // Save lazy mode
+    auto lazyEval = ExecutorScope::Current()->lazyEval;
+    auto lazyMode = ExecutorScope::Current()->getLazyMode();
+    ExecutorScope::Current()->lazyEval = true;
+    ExecutorScope::Current()->setLazyComputeMode(Executor::LAZY_FULL);
     auto input  = _Input({l}, NCHW);
     auto output = _MatMul(input, weight, false, true);
     if (!hasBias) {
@@ -407,6 +414,10 @@ Module* NN::Linear(int l, int t, bool hasBias, std::shared_ptr<Initializer> weig
     output    = _Add(output, bias);
     auto module = NN::extract({input}, {output}, true);
     module->setType("Linear");
+    // Revert lazy mode
+    ExecutorScope::Current()->lazyEval = lazyEval;
+    ExecutorScope::Current()->setLazyComputeMode(lazyMode);
+
     return module;
 }
 
@@ -561,7 +572,7 @@ public:
                     mWinogradAttr.reset(new WinogradInt8Attr);
                     mWinogradTransInputMaxPos = addParameter(mWinogradTransInputMax);
                     mWinogradTransInputMinPos = addParameter(mWinogradTransInputMin);
-                    mWinogradTransWeightScalePos = addParameter(nullptr);
+                    mWinogradTransWeightScalePos = addParameter(mWinogradTransInputMax);
                 }
                 setName(mConvParameter.name);
                 modules[i] = nullptr;
@@ -592,11 +603,11 @@ public:
         mWeightClampValue = _Scalar<float>(mLimit);
         // mInputClampValue = _Scalar<float>(mLimit);
         // mOutputClampValue = _Scalar<float>(mLimit);
-        
+
         // lower bits only apply to weights
         mInputClampValue = _Scalar<float>((float)(1 << (8 - 1)) - 1.0f);
         mOutputClampValue = _Scalar<float>((float)(1 << (8 - 1)) - 1.0f);
-        
+
         mInputMinPos = addParameter(mInputMin);
         mInputMaxPos = addParameter(mInputMax);
         mOutputMinPos = addParameter(mOutputMin);
@@ -675,6 +686,10 @@ public:
         if (nullptr == originValue) {
             return newValue;
         }
+        auto ptr = originValue->readMap<float>();
+        if (ptr[0] == -100.0f) {
+            return newValue;
+        }
         switch (mScaleUpdateMethod) {
             case NN::MovingAverage:
                 return originValue * _Scalar<float>(mMomentum) + newValue * _Scalar<float>(1.0f-mMomentum);
@@ -696,11 +711,11 @@ public:
         int threadNumber = 1, ePack = 12;
         int unit2   = UP_DIV(outH * outW, ePack * threadNumber);
         int maxUnit = (int)::sqrtf((float)unit2);
-        const int MAX_UNIT = 4, MIN_UNIT = 2;
+        const int MAX_UNIT = 6, MIN_UNIT = 2;
         maxUnit = std::max(std::min(maxUnit, MAX_UNIT), MIN_UNIT);
 
         auto units = std::pair<int, int>({0, 0});
-        float maxRate = 1.0f, originCost = outH * outW * inChannel * outChannel * kernelH * kernelW;
+        float maxRate = 2.0f, originCost = outH * outW * inChannel * outChannel * kernelH * kernelW;
         std::set<int> supportSu{4, 6};
         for (int uh = MIN_UNIT; uh <= maxUnit; ++uh) {
             for (int uw = MIN_UNIT; uw <= maxUnit; ++uw) {
@@ -750,31 +765,33 @@ public:
         xx = _Im2Col(xx, {alphaW, alphaH}, {1, 1}, {0, 0}, {unitW, unitH});
         // [N * h_unit_num * w_unit_num, ic, alphaH, alphaW]
         xx = _Transpose(_Reshape(xx, {inChannel, alphaH, alphaW, -1}), {3, 0, 1, 2});
-        Math::WinogradGenerater genH(unitH, kernelH), genW(unitW, kernelW);
+        // Must be the same as ConvInt8Winograd.cpp
+        Math::WinogradGenerater genH(unitH, kernelH,  1, true), genW(unitW, kernelW,  1, true);
         auto srcTransH = _Const(genH.B()->host<void>(), {alphaH, alphaH}, NCHW);
         auto srcTransW = _Const(genW.B()->host<void>(), {alphaW, alphaW}, NCHW);
         xx = _MatMul(_MatMul(_Transpose(srcTransH, {1, 0}), xx), srcTransW);
         // [alphaH * alphaW, ic, N * h_unit_num * w_unit_num]
         xx = _Reshape(_Transpose(xx, {2, 3, 1, 0}), {alphaH * alphaW, inChannel, -1});
-        
+
         auto inputPair = fakeQuantFeatureWithMinMax(xx, nullptr, nullptr, mInputClampValue, {1, 2, 3});
         mWinogradTransInputMin = updateParameter(mWinogradTransInputMin, inputPair[1]);
         mWinogradTransInputMax = updateParameter(mWinogradTransInputMax, inputPair[2]);
         setParameter(mWinogradTransInputMin, mWinogradTransInputMinPos);
         setParameter(mWinogradTransInputMax, mWinogradTransInputMaxPos);
-        
+
         auto wTransH = _Const(genH.G()->host<void>(), {alphaH, kernelH}, NCHW);
         auto wTransW = _Const(genW.G()->host<void>(), {alphaW, kernelW}, NCHW);
         // [oc, ic, alphaH, alphaW]
         auto ww = _MatMul(_MatMul(wTransH, weight), _Transpose(wTransW, {1, 0}));
         // [alphaH * alphaW, oc, ic]
         ww = _Transpose(_Reshape(ww, {outChannel, inChannel, -1}), {2, 0, 1});
-        
+        auto wwInfo = ww->getInfo();
+
         // simulate weight quant
-        auto weightScale = _Maximum(_ReduceMax(_Abs(ww), {1, 2}, true), _Scalar<float>(1E-6)) * _Reciprocal(mWeightClampValue);
+        auto weightScale = _Maximum(_ReduceMax(_Abs(ww), {2}, true), _Scalar<float>(1E-6)) * _Reciprocal(mWeightClampValue);
 //        ww = clamp(_Round(ww * _Reciprocal(weightScale)), mWeightClampValue) * weightScale;
         setParameter(weightScale, mWinogradTransWeightScalePos);
-        
+
         // [alphaH * alphaW, oc, N * h_unit_num * w_unit_num]
         auto yy = _MatMul(ww, xx);
         // [oc, N * h_unit_num * w_unit_num, alphaH, alphaW]
@@ -813,6 +830,13 @@ public:
             // simulate output quant to get original output scale
             if (mWinogradAttr != nullptr && bestWinogradUnit(x)) {
                 res = _winogradConv(x, weightTemp);
+#ifdef MNN_WINOGRAD_DEBUG
+                VARP res2 = _Conv(weightTemp, mBias, _Convert(inputPair[0], NC4HW4), mOption.padMode, mOption.stride,
+                            mOption.dilate, mGroup, mOption.pads);
+                auto diff = res2 - res;
+                diff = diff * diff;
+                FUNC_PRINT_ALL(_ReduceMax(diff)->readMap<float>()[0], f);
+#endif
             } else {
                 res = _Conv(weightTemp, mBias, _Convert(inputPair[0], NC4HW4), mOption.padMode, mOption.stride,
                             mOption.dilate, mGroup, mOption.pads);
@@ -871,7 +895,7 @@ public:
             // fold bn to conv weights and bias
             VARP fusedWeights = mWeight;
             VARP fusedBias = mBias;
-            fusedBias = _Reshape(fusedBias, {fusedBias->getInfo()->size, 1, 1, 1});
+            fusedBias = _Reshape(fusedBias, {static_cast<int>(fusedBias->getInfo()->size), 1, 1, 1});
             if (mBatchNorm) {
                 auto bn = std::static_pointer_cast<BatchNormModule>(mBatchNorm);
                 auto bnMean = bn->runningMean();
@@ -885,8 +909,8 @@ public:
                 auto alpha = rStd * bnScale;
                 auto beta  = bnBias - bnMean * rStd * bnScale;
 
-                alpha = _Reshape(alpha, {alpha->getInfo()->size, 1, 1, 1});
-                beta = _Reshape(beta, {beta->getInfo()->size, 1, 1, 1});
+                alpha = _Reshape(alpha, {static_cast<int>(alpha->getInfo()->size), 1, 1, 1});
+                beta = _Reshape(beta, {static_cast<int>(beta->getInfo()->size), 1, 1, 1});
 
                 fusedWeights = alpha * fusedWeights;
                 fusedBias = alpha * fusedBias + beta;
@@ -950,7 +974,7 @@ public:
                     bias.resize(biasinfo->size);
                     auto ptr = fusedBias->readMap<float>();
                     ::memcpy(bias.data(), ptr, bias.size() * sizeof(float));
-                    
+
                     auto info = weightScale->getInfo();
                     weightScaleVector.resize(info->size);
                     MNN_ASSERT(weightScaleVector.size() == bias.size());
@@ -960,7 +984,7 @@ public:
             }
             bool relu = mActivation == NN::None ? false : true;
             res = _Conv(std::move(weight), std::move(bias), std::move(weightScaleVector), _Convert(x, NC4HW4), mOption.channel,
-                        mOption.kernelSize, mOption.padMode, mOption.stride, mOption.dilate, mGroup, mOption.pads, relu, 
+                        mOption.kernelSize, mOption.padMode, mOption.stride, mOption.dilate, mGroup, mOption.pads, relu,
                         mInputScale->readMap<float>()[0], mOutputScale->readMap<float>()[0],
                         inputZeroPoint, outputZeroPoint,
                         -int8_t(mOutputClampValue->readMap<float>()[0]), int8_t(mOutputClampValue->readMap<float>()[0]), mWeightClampValue->readMap<float>()[0], mAccumulateToInt16);
@@ -969,7 +993,7 @@ public:
                 auto inputScaleVar = scaleAndZeroPoint.first;
                 auto inputZeroPointVar = scaleAndZeroPoint.second;
                 auto weightScaleVar = parameters()[mWinogradTransWeightScalePos];
-                
+
                 // Winograd Transformed input scale
                 auto inputScaleInfo = inputScaleVar->getInfo();
                 auto inputScaleData = inputScaleVar->readMap<float>();
@@ -995,11 +1019,11 @@ public:
                     return {};
                 }
                 std::vector<float> weightScales(weightScaleData, weightScaleData + weightScaleInfo->size);
-                
+
                 mWinogradAttr->attrs[0].inputScales = inputScales;
                 mWinogradAttr->attrs[0].inputZeroPoints = inputZeroPoints;
                 mWinogradAttr->attrs[0].weightScales = weightScales;
-                
+
                 res = mWinogradAttr->turnToWinogradConv(res);
             }
             res->setName(name());
@@ -1088,8 +1112,8 @@ private:
     NN::ScaleUpdateMethod mScaleUpdateMethod;
     bool mAccumulateToInt16 = false;
     std::shared_ptr<WinogradInt8Attr> mWinogradAttr;
-    VARP mWinogradTransInputMin = nullptr;
-    VARP mWinogradTransInputMax = nullptr;
+    VARP mWinogradTransInputMin = _Const(-100.f);
+    VARP mWinogradTransInputMax = _Const(-100.f);
     int mWinogradTransInputMinPos = -1;
     int mWinogradTransInputMaxPos = -1;
     int mWinogradTransWeightScalePos = -1;

@@ -1,5 +1,5 @@
 //
-//  InterpBufExecution.cpp
+//  Interp3DBufExecution.cpp
 //  MNN
 //
 //  Created by MNN on 2019/02/28.
@@ -9,12 +9,13 @@
 #ifndef MNN_OPENCL_BUFFER_CLOSED
 
 #include "backend/opencl/execution/buffer/Interp3DBufExecution.hpp"
-#include "core/TensorUtils.hpp"
 
 namespace MNN {
 namespace OpenCL {
 
-Interp3DBufExecution::Interp3DBufExecution(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend) : Execution(backend) {
+Interp3DBufExecution::Interp3DBufExecution(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend) : CommonExecution(backend, op) {
+    mUnits.resize(1);
+    auto &unit = mUnits[0];
     mOpenCLBackend = static_cast<OpenCLBackend *>(backend);
     auto runtime   = mOpenCLBackend->getOpenCLRuntime();
     auto interp3DParam = op->main_as_Interp();
@@ -27,17 +28,18 @@ Interp3DBufExecution::Interp3DBufExecution(const std::vector<Tensor *> &inputs, 
     std::set<std::string> buildOptions;
     if (op->main_as_Interp()->resizeType() == 1) {
         mKernelName = "nearest3D_buf";
-        mKernel                = runtime->buildKernel("interp_buf", mKernelName, buildOptions);
+        unit.kernel                = runtime->buildKernel("interp_buf", mKernelName, buildOptions);
     } else {
         MNN_ERROR("Resize type other than nearest is not supported in Interp3DBuf, change to nearest!");
         mKernelName = "nearest3D_buf";
-        mKernel                = runtime->buildKernel("interp_buf", mKernelName, buildOptions);
+        unit.kernel                = runtime->buildKernel("interp_buf", mKernelName, buildOptions);
     }
 
-    mMaxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel));
+    mMaxWorkGroupSize = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(unit.kernel));
 }
 
-ErrorCode Interp3DBufExecution::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+ErrorCode Interp3DBufExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+    auto &unit = mUnits[0];
     Tensor *input  = inputs[0];
     Tensor *output = outputs[0];
     auto runtime = ((OpenCLBackend *)backend())->getOpenCLRuntime();
@@ -66,54 +68,52 @@ ErrorCode Interp3DBufExecution::onResize(const std::vector<Tensor *> &inputs, co
     MNN_ASSERT(outputDepth > 0 && outputHeight > 0 && outputWidth > 0);
 
     uint32_t idx = 0;
-    mKernel.setArg(idx++, mGWS[0]);
-    mKernel.setArg(idx++, mGWS[1]);
-    mKernel.setArg(idx++, mGWS[2]);
-    mKernel.setArg(idx++, openCLBuffer(input));
-    mKernel.setArg(idx++, openCLBuffer(output));
-    mKernel.setArg(idx++, mCordTransform[4]);
-    mKernel.setArg(idx++, mCordTransform[2]);
-    mKernel.setArg(idx++, mCordTransform[0]);
-    mKernel.setArg(idx++, mCordTransform[5]);
-    mKernel.setArg(idx++, mCordTransform[3]);
-    mKernel.setArg(idx++, mCordTransform[1]);
-    mKernel.setArg(idx++, static_cast<int32_t>(inputDepth));
-    mKernel.setArg(idx++, static_cast<int32_t>(inputHeight));
-    mKernel.setArg(idx++, static_cast<int32_t>(inputWidth));
-    mKernel.setArg(idx++, static_cast<int32_t>(outputDepth));
-    mKernel.setArg(idx++, static_cast<int32_t>(outputHeight));
-    mKernel.setArg(idx++, static_cast<int32_t>(outputWidth));
-    mKernel.setArg(idx++, static_cast<int32_t>(channelBlocks));
+    cl_int ret = CL_SUCCESS;
+    ret |= unit.kernel->get().setArg(idx++, mGWS[0]);
+    ret |= unit.kernel->get().setArg(idx++, mGWS[1]);
+    ret |= unit.kernel->get().setArg(idx++, mGWS[2]);
+    ret |= unit.kernel->get().setArg(idx++, openCLBuffer(input));
+    ret |= unit.kernel->get().setArg(idx++, openCLBuffer(output));
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[4]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[2]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[0]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[5]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[3]);
+    ret |= unit.kernel->get().setArg(idx++, mCordTransform[1]);
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(inputDepth));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(inputHeight));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(inputWidth));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(outputDepth));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(outputHeight));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(outputWidth));
+    ret |= unit.kernel->get().setArg(idx++, static_cast<int32_t>(inputBatch));
+    MNN_CHECK_CL_SUCCESS(ret, "setArg Interp3DBufExecution");
 
-    mLWS = localWS3DDefault(mGWS, mMaxWorkGroupSize, runtime, mKernelName, mKernel).first;
+    mLWS = localWS3DDefault(mGWS, mMaxWorkGroupSize, runtime, mKernelName, unit.kernel).first;
+    mOpenCLBackend->recordKernel3d(unit.kernel, mGWS, mLWS);
+    unit.globalWorkSize = {mGWS[0], mGWS[1], mGWS[2]};
+    unit.localWorkSize = {mLWS[0], mLWS[1], mLWS[2]};
     return NO_ERROR;
 
 }
 
-ErrorCode Interp3DBufExecution::onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-#ifdef LOG_VERBOSE
-    MNN_PRINT("Start InterpBufExecution onExecute... \n");
-#endif
+class Interp3DBufCreator : public OpenCLBackend::Creator {
+public:
+    virtual ~Interp3DBufCreator() = default;
+    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
+                                const MNN::Op *op, Backend *backend) const override {
+        for (int i = 0; i < inputs.size(); ++i) {
+            TensorUtils::setTensorSupportPack(inputs[i], false);
+        }
+        for (int i = 0; i < outputs.size(); ++i) {
+            TensorUtils::setTensorSupportPack(outputs[i], false);
+        }
+        return new Interp3DBufExecution(inputs, op, backend);
+        ;
+    }
+};
 
-#ifdef ENABLE_OPENCL_TIME_PROFILER
-    cl::Event event;
-    run3DKernelDefault(mKernel, mGWS, mLWS,
-                       mOpenCLBackend->getOpenCLRuntime(), &event);
-    
-    int costTime = (int)mOpenCLBackend->getOpenCLRuntime()->getCostTime(&event);
-    MNN_PRINT("kernel cost:%d    us Interp\n",costTime);
-#else
-    run3DKernelDefault(mKernel, mGWS, mLWS, mOpenCLBackend->getOpenCLRuntime());
-#endif
-
-#ifdef LOG_VERBOSE
-    MNN_PRINT("end InterpBufExecution onExecute... \n");
-#endif
-
-    return NO_ERROR;
-}
-
-OpenCLCreatorRegister<TypedCreator<Interp3DBufExecution>> __Interp3DBuf_op_(OpType_Interp3D, BUFFER);
+REGISTER_OPENCL_OP_CREATOR(Interp3DBufCreator, OpType_Interp3D, BUFFER);
 
 } // namespace OpenCL
 } // namespace MNN

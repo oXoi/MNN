@@ -31,13 +31,23 @@ public:
         // Do nothing
     }
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
+        auto bytes = static_cast<CUDABackend*>(backend())->getBytes(outputs[0]);
+        auto pool = static_cast<CUDABackend*>(backend())->getBufferPool();
         if (1 == mLoop->commands()->size()) {
             auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
             auto op = cmd->op();
             if (OpType_MatMul == op->type() && mLoop->parallel() && mLoop->loopNumber() > 1) {
+                auto step = cmd->steps()->data();
                 if (inputs.size() <= 3) {
                     auto& unit = mExecutions[0];
-                    unit.exe.reset(new MatMulExecution(op->main_as_MatMul()->transposeA(),  op->main_as_MatMul()->transposeB(), backend()));
+                    int as = 1, bs = 1, cs = 1;
+                    if (step[1] == 0) {
+                        as = 0;
+                    }
+                    if (step[2] == 0) {
+                        bs = 0;
+                    }
+                    unit.exe.reset(new MatMulExecution(op->main_as_MatMul()->transposeA(),  op->main_as_MatMul()->transposeB(), backend(), as, bs, cs));
                     if (nullptr == unit.exe) {
                         return OUT_OF_MEMORY;
                     }
@@ -149,13 +159,20 @@ public:
             }
             return NO_ERROR;
         }
+        if (nullptr != mLoop->initCommand()) {
+            for (int i=0; i<mLoop->initCommand()->size(); ++i) {
+                auto cmd = mLoop->initCommand()->GetAs<RegionCommand>(i);
+                auto index = cmd->indexes()->data()[0];
+                auto tensor = mStack[index];
+                auto size = static_cast<CUDABackend*>(backend())->realSize(tensor) * sizeof(float);
+                runtime->memset((void*)tensor->deviceId(), 0, size);
+            }
+        }
         if (1 == mLoop->commands()->size()) {
             auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
             auto op = cmd->op();
 
-
-
-            if (OpType_UnaryOp == op->type() && nullptr == op->main()) {
+            if (OpType_UnaryOp == op->type() && nullptr == op->main() && cmd->fuse() < 0) {
                 Tensor::InsideDescribe::Region reg;
                 auto srcView = cmd->view()->GetAs<View>(1);
                 auto dstView = cmd->view()->GetAs<View>(0);
@@ -179,14 +196,33 @@ public:
                 if (index1 >= 0) {
                     srcIndice = (int32_t*)originInputs[index1]->deviceId();
                 }
-
+                auto src = (uint8_t*)(input->deviceId()) + srcView->offset() * bytes;
+                auto dstOrigin = (output->deviceId()) + dstView->offset() * bytes;
+                auto dst = dstOrigin;
                 BlitWithIndice(
-                    (uint8_t*)(output->deviceId()) + dstView->offset() * bytes,
-                    (uint8_t*)(input->deviceId()) + srcView->offset() * bytes,
-                    dstIndice, srcIndice, index0, index1,
-                    loopNumber, step0, step1, input->elementSize(),
-                    reg, bytes, runtime);
+                        (uint8_t*)dst,
+                        (uint8_t*)src,
+                        dstIndice, srcIndice, index0, index1,
+                        loopNumber, step0, step1, input->elementSize(),
+                        reg, bytes, runtime);
 
+
+                if(cmd->fuse() >= 0) {
+                    auto opType = cmd->fuse();
+                    auto dstStride = cmd->view()->GetAs<View>(0)->stride()->data();
+                    auto srcStride0 = dstStride;
+                    auto srcStride1 = dstStride;
+                    int32_t tmpSize[3];
+                    ::memcpy(tmpSize, cmd->size()->data(), 3 * sizeof(int32_t));
+                    tmpSize[0] *=  loopNumber;
+                    auto type = halide_type_of<float>();
+                    if (static_cast<CUDABackend*>(backend())->useFp16()) {
+                        type.bits = 16;
+                    }
+                    // MNN_PRINT("Binary Loop in optype:%d\n", opType);
+                    BinaryBlit((uint8_t*)dstOrigin, (uint8_t*)dstOrigin, (const uint8_t*)dst,
+                        tmpSize, srcStride0, srcStride1, dstStride, type, runtime, opType);
+                }
                 return NO_ERROR;
             }
         }
@@ -212,12 +248,17 @@ public:
                     offset = offset * cmd->steps()->data()[v] + view->offset();
                     mStackPtr[tensorIndex] = tensor->deviceId() + offset * static_cast<CUDABackend*>(backend())->getBytes(tensor);
                 }
+
+                auto dstOrigin = mStackPtr[cmd->indexes()->data()[0]];
+                auto dst = dstOrigin;
+                auto dstStride = cmd->view()->GetAs<View>(0)->stride()->data();
+
                 if (OpType_UnaryOp == op->type()) {
+
                     auto src = (float*)mStackPtr[cmd->indexes()->data()[1]];
-                    auto dst = (float*)mStackPtr[cmd->indexes()->data()[0]];
                     int unaryType = op->main_as_UnaryOp()->opType();
+
                     auto srcStride = cmd->view()->GetAs<View>(1)->stride()->data();
-                    auto dstStride = cmd->view()->GetAs<View>(0)->stride()->data();
                     UnaryBlit((uint8_t*)dst, (const uint8_t*)src, cmd->size()->data(), srcStride, dstStride, bytes, runtime, unaryType);
                     continue;
                 }
@@ -226,13 +267,13 @@ public:
                     if (3 == size) {
                         unit.inputs[0]->buffer().device = mStackPtr[cmd->indexes()->data()[1]];
                         unit.inputs[1]->buffer().device = mStackPtr[cmd->indexes()->data()[2]];
-                        unit.outputs[0]->buffer().device = mStackPtr[cmd->indexes()->data()[0]];
+                        unit.outputs[0]->buffer().device = dst;
                     } else {
                         MNN_ASSERT(4 == size);
                         unit.inputs[0]->buffer().device = mStackPtr[cmd->indexes()->data()[1]];
                         unit.inputs[1]->buffer().device = mStackPtr[cmd->indexes()->data()[2]];
                         unit.inputs[2]->buffer().device = mStackPtr[cmd->indexes()->data()[3]];
-                        unit.outputs[0]->buffer().device = mStackPtr[cmd->indexes()->data()[0]];
+                        unit.outputs[0]->buffer().device = dst;
                     }
                     unit.exe->onExecute(unit.inputs, unit.outputs);
                     continue;
@@ -244,15 +285,17 @@ public:
                     }
                     auto src0 = mStackPtr[cmd->indexes()->data()[1]];
                     auto src1 = mStackPtr[cmd->indexes()->data()[2]];
-                    auto dst = mStackPtr[cmd->indexes()->data()[0]];
                     auto opType = op->main_as_BinaryOp()->opType();
                     auto srcStride0 = cmd->view()->GetAs<View>(1)->stride()->data();
                     auto srcStride1 = cmd->view()->GetAs<View>(2)->stride()->data();
-                    auto dstStride = cmd->view()->GetAs<View>(0)->stride()->data();
-                    //MNN_PRINT("Binary Loop in optype:%d\n", opType);
-                    BinaryBlit((uint8_t*)dst, (const uint8_t*)src0, (const uint8_t*)src1,
-                        cmd->size()->data(), srcStride0, srcStride1, dstStride, type, runtime, opType);
-
+                    if (cmd->fuse() == 0) {
+                        BinaryBlitFuse((uint8_t*)dst, (const uint8_t*)src0, (const uint8_t*)src1,
+                            cmd->size()->data(), srcStride0, srcStride1, dstStride, type, runtime, opType);
+                    } else {
+                        // MNN_PRINT("Binary Loop in optype:%d\n", opType);
+                        BinaryBlit((uint8_t*)dst, (const uint8_t*)src0, (const uint8_t*)src1,
+                            cmd->size()->data(), srcStride0, srcStride1, dstStride, type, runtime, opType);
+                    }
                 }
             }
         }
@@ -275,6 +318,36 @@ public:
         if (op->main_type() != OpParameter_LoopParam) {
             return nullptr;
         }
+        auto mLoop = op->main_as_LoopParam();
+        for (int i=0; i<mLoop->commands()->size(); ++i) {
+            auto cmd = mLoop->commands()->GetAs<RegionCommand>(i);
+
+            if(cmd->fuse() > 0) {
+                // Currently don't need not add fuse
+                return nullptr;//
+            }
+            if(cmd->fuse() == 0) {
+                if (cmd->op()->type() != OpType_BinaryOp) {
+                    // TODO: support afterwards
+                    return nullptr;
+                }
+                auto bytes = static_cast<CUDABackend*>(backend)->getBytes(outputs[0]);
+                if (2 == bytes) {
+                    return nullptr;
+                }
+            }
+        }
+        if (nullptr != mLoop->initCommand()) {
+            for (int i=0; i<mLoop->initCommand()->size(); ++i) {
+                auto cmd = mLoop->initCommand()->GetAs<RegionCommand>(i);
+                if (nullptr != cmd->op()) {
+                    // Currently don't support other init
+                    return nullptr;
+                }
+            }
+
+        }
+
         return new CUDALoop(backend, op->main_as_LoopParam());
     }
 };

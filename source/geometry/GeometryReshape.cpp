@@ -59,7 +59,10 @@ public:
         des->regions[0].origin = inputs[0];
         des->regions[0].size[0] = 1;
         des->regions[0].size[1] = 1;
-        des->regions[0].size[2] = inputs[0]->elementSize();
+        des->regions[0].size[2] = 1;
+        for (int i = 0; i < inputs[0]->dimensions(); ++i) {
+            des->regions[0].size[2] *= inputs[0]->length(i);
+        }
         des->regions[0].src.stride[2] = 1;
         des->regions[0].dst.stride[2] = 1;
         des->regions[0].src.offset = 0;
@@ -87,6 +90,10 @@ class CopyGeometryComputer : public GeometryComputer {
             auto output     = outputs[v];
             auto inputDes   = TensorUtils::getDescribe(input);
             auto outputDes  = TensorUtils::getDescribe(output);
+            if (inputDes->tensorArrayAttr != nullptr) {
+                outputDes->tensorArrayAttr = inputDes->tensorArrayAttr;
+                return true;
+            }
             outputDes->regions = {TensorUtils::makeFullSlice(input)};
             outputDes->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
         }
@@ -100,7 +107,7 @@ static void _create() {
     std::shared_ptr<GeometryComputer> _comp(new SingleGeometryComputer);
     GeometryComputer::registerGeometryComputer(_comp, {OpType_Squeeze, OpType_Unsqueeze, OpType_ExpandDims, OpType_Flatten, OpType_QuantizedReshape});
     std::shared_ptr<GeometryComputer> copycomp(new CopyGeometryComputer);
-    GeometryComputer::registerGeometryComputer(comp, {OpType_Identity});
+    GeometryComputer::registerGeometryComputer(copycomp, {OpType_Identity});
 }
 
 REGISTER_GEOMETRY(GeometryReshape, _create);

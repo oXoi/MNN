@@ -40,16 +40,17 @@ public:
 
     bool lazyEval = true;
     enum LazyMode {
-        // Don't compute at all until user needed.
-        LAZY_FULL,
-        
+        LAZY_FULL = 0,
         // Don't compute content until user needed.
-        LAZY_CONTENT
+        LAZY_CONTENT = 1 << 0,
+        
+        // Expr can only compute once, it can reduce the create cost of expr
+        LAZY_COMPUTE_ONCE = 1 << 1,
     };
-    LazyMode getLazyMode() const {
+    uint32_t getLazyMode() const {
         return mLazyMode;
     }
-    void setLazyComputeMode(LazyMode mode);
+    void setLazyComputeMode(uint32_t mode);
     void setGlobalExecutorConfig(MNNForwardType type, const BackendConfig& config, int numberThread);
     int getCurrentRuntimeStatus(RuntimeStatus statusEnum);
     enum GCFlag {
@@ -68,11 +69,6 @@ public:
     struct SubGraph;
     bool registerSubGraph(const std::string& submoduleName, VARPS outputs, VARPS inputs);
     std::shared_ptr<SubGraph> findSubGraph(const std::string& submoduleName);
-    /**Internal Usage Begin*/
-    void addOpCostTime(int op, float costTime);
-    void addOpCostTime(const std::string& type, float costTime);
-    void addOpFlops(const std::string& type, float flops);
-    /**Internal Usage End*/
     static RuntimeInfo getRuntime();
     void setCallBack(TensorCallBackWithInfo&& before, TensorCallBackWithInfo&& after);
     const DebugTools* getDebugTools() const {
@@ -108,6 +104,13 @@ public:
         void setCache(std::string cacheName);
         
         /**
+         * @brief set the path of external files or directory
+         * @param path -- The path of a file or directory on disk
+         * @param type -- Type of the external path (see "enum ExternalPathType" in Interpreter.hpp)
+         */
+        void setExternalPath(std::string path, int type);
+        
+        /**
          * @brief set external file.
          */
         void setExternalFile(std::string fileName);
@@ -122,25 +125,30 @@ public:
         friend class Executor;
         void setMode(Interpreter::SessionMode mode);
         void setHint(Interpreter::HintMode mode, int value);
+        void setHintPtr(Interpreter::HintMode mode, void* value);
         bool getInfo(Interpreter::SessionInfoCode code, void* ptr);
         BackendConfig* getBnConfig();
         const RuntimeAttr* getInside() const {
             return mInside;
         }
     private:
+        std::mutex mLock;
         RuntimeAttr* mInside;
         friend class StaticModule;
         RuntimeManager();
     };
+    static bool getComputeInfo(EXPRP expr, Interpreter::SessionInfoCode code, void* ptr);
 private:
+    std::shared_ptr<Runtime> _getOrCreateRuntime(MNNForwardType type, const BackendConfig* config, int numberThread, bool reset = true);
     Executor(std::shared_ptr<Runtime> backend, MNNForwardType type, int numberThread);
     void _makeCache(const std::vector<EXPRP>& outputs, bool forceCPU);
 
-    std::map<std::pair<MNNForwardType, int>, std::shared_ptr<Runtime>> mRuntimes;
+    RuntimeInfo mRuntimeInfo;
     std::shared_ptr<DebugTools> mDebug;
     std::map<std::string, std::shared_ptr<SubGraph>> mSubGraph;
-    LazyMode mLazyMode = LAZY_FULL;
+    uint32_t mLazyMode = 0;
     std::shared_ptr<ExecutorAttr> mAttr;
+    std::mutex mMutex;
 };
 } // namespace Express
 } // namespace MNN

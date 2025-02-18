@@ -7,6 +7,7 @@
 //
 
 #include <MNN/expr/ExprCreator.hpp>
+#include "ParameterOptimizer.hpp"
 #include <fstream>
 #include <map>
 #include <queue>
@@ -18,6 +19,10 @@
 #include "OpGrad.hpp"
 #include "Transformer.hpp"
 #include "core/Macro.h"
+#include "flatbuffers/idl.h"
+#include "flatbuffers/minireflect.h"
+#include "flatbuffers/util.h"
+#include "TrainInfo_generated.h"
 #define USE_ELU
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
@@ -31,9 +36,14 @@ using namespace std;
 
 int main(int argc, const char* argv[]) {
     if (argc < 4) {
-        MNN_PRINT("Usage: ./transformer.out temp.bin dst.bin config.json\n");
+        MNN_PRINT("Usage: ./transformer.out temp.bin dst.bin config.json [revertInfo.json]\n");
         return 0;
     }
+    std::string revertConfigFile = "revert.json";
+    if (argc >= 5) {
+        revertConfigFile = argv[4];
+    }
+    FUNC_PRINT_ALL(revertConfigFile.c_str(), s);
     rapidjson::Document document;
     {
         std::ifstream fileNames(argv[3]);
@@ -54,33 +64,60 @@ int main(int argc, const char* argv[]) {
     std::vector<std::string> onlyUpdateOps;
     std::vector<std::string> stopBackPropOps;
     std::string optimizerType = "SGD";
-    if (configObject.HasMember("Optimizor")) {
-        auto optimizor = configObject["Optimizor"].GetObject();
-        if (optimizor.HasMember("OnlyUpdateOps")) {
-            auto limitArray = optimizor["OnlyUpdateOps"].GetArray();
+    std::vector<std::string> fixAsConstOps;
+    std::vector<std::vector<std::string>> weightNameGroups;
+    std::vector<MNN::Express::VARP> lrNames;
+    if (configObject.HasMember("Optimizer")) {
+        auto optimizer = configObject["Optimizer"].GetObject();
+        if (optimizer.HasMember("OnlyUpdateOps")) {
+            auto limitArray = optimizer["OnlyUpdateOps"].GetArray();
             for (auto vIter = limitArray.begin(); vIter != limitArray.end(); vIter++) {
                 onlyUpdateOps.emplace_back(vIter->GetString());
                 MNN_PRINT("will only update: %s \n", vIter->GetString());
             }
         }
-        if (optimizor.HasMember("NoUpdateOps")) {
-            auto limitArray = optimizor["NoUpdateOps"].GetArray();
+        if (optimizer.HasMember("NoUpdateOps")) {
+            auto limitArray = optimizer["NoUpdateOps"].GetArray();
             for (auto vIter = limitArray.begin(); vIter != limitArray.end(); vIter++) {
                 noUpdateOps.emplace_back(vIter->GetString());
                 if (onlyUpdateOps.empty())
                     MNN_PRINT("will not update: %s \n", vIter->GetString());
             }
         }
-        if (optimizor.HasMember("StopBackPropOps")) {
-            auto limitArray = optimizor["StopBackPropOps"].GetArray();
+        if (optimizer.HasMember("StopBackPropOps")) {
+            auto limitArray = optimizer["StopBackPropOps"].GetArray();
             for (auto vIter = limitArray.begin(); vIter != limitArray.end(); vIter++) {
                 stopBackPropOps.emplace_back(vIter->GetString());
                 MNN_PRINT("will stop back prop from (also not update this op): %s \n", vIter->GetString());
             }
         }
-        if (optimizor.HasMember("type")) {
-            optimizerType = std::string(optimizor["type"].GetString());
+        if (optimizer.HasMember("type")) {
+            optimizerType = std::string(optimizer["type"].GetString());
             MNN_PRINT("optimizer type: %s\n", optimizerType.c_str());
+        }
+        if (optimizer.HasMember("FixAsConstOps")) {
+            auto limitArray = optimizer["FixAsConstOps"].GetArray();
+            for (auto vIter = limitArray.begin(); vIter != limitArray.end(); vIter++) {
+                fixAsConstOps.emplace_back(vIter->GetString());
+                MNN_PRINT("this op will be fixed as Const, and maybe turn to Trainable later: %s \n", vIter->GetString());
+            }
+        }
+        if (optimizer.HasMember("ParameterOptConfig")) {
+            auto pConf = optimizer["ParameterOptConfig"].GetArray();
+            for (auto vIter = pConf.begin(); vIter != pConf.end(); vIter++) {
+                auto conf = vIter->GetObject();
+                if (conf.HasMember("WeightNames") && conf.HasMember("LrName")) {
+                    auto wn = conf["WeightNames"].GetArray();
+                    std::vector<std::string> wNames;
+                    for (auto wIter = wn.begin(); wIter != wn.end(); wIter++) {
+                        wNames.push_back(wIter->GetString());
+                    }
+                    weightNameGroups.push_back(wNames);
+                    auto lr = _Input({}, NCHW);
+                    lr->setName(conf["LrName"].GetString());
+                    lrNames.push_back(lr);
+                }
+            }
         }
     }
     auto bnMomentum = new MNN::AttributeT;
@@ -95,10 +132,32 @@ int main(int argc, const char* argv[]) {
     FUNC_PRINT_ALL(inputModeFileName, s);
     std::map<std::string, VARP> inputVars;
     std::map<std::string, VARP> outputVars;
+    MNN::Usage netUsage;
+    {
+        // Load usage
+        std::shared_ptr<MNN::Interpreter> net(MNN::Interpreter::createFromFile(argv[1]));
+        auto buffer = net->getModelBuffer();
+        auto netStruct = flatbuffers::GetRoot<MNN::Net>(buffer.first);
+        netUsage = netStruct->usage();
+    }
+    if (Usage_INFERENCE_STATIC == netUsage) {
+        Executor::getGlobalExecutor()->setLazyComputeMode(MNN::Express::Executor::LAZY_CONTENT);
+    }
     {
         auto inputsOutputs = Variable::getInputAndOutput(Variable::loadMap(argv[1]));
         inputVars = inputsOutputs.first;
         outputVars = inputsOutputs.second;
+    }
+    for (auto& varIter : inputVars) {
+        auto var = varIter.second;
+        auto varInfo = var->getInfo();
+        auto vDims = varInfo->dim;
+        
+        if (!fixAsConstOps.empty()) {
+            if (std::find(fixAsConstOps.begin(), fixAsConstOps.end(), var->name()) != fixAsConstOps.end()) {
+                var.fix(VARP::CONSTANT);
+            }
+        }
     }
     Transformer::TrainConfig trainConfig;
     trainConfig.noUpdateOps = std::move(noUpdateOps);
@@ -106,7 +165,35 @@ int main(int argc, const char* argv[]) {
     trainConfig.extraParams["BatchNorm"]["momentum"] = bnMomentum;
     auto turnTrainable = Train::TurnTrainable(trainConfig);
     turnTrainable.onExecute(Variable::mapToSequence(outputVars));
-    auto trainInfo = turnTrainable.trainInfo;
+    {
+        // Save Train Revert Info
+        std::unique_ptr<MNNTrain::TrainInfoT> trainInfo(new MNNTrain::TrainInfoT);
+        for (auto& bnIter : turnTrainable.mTrainInfo.bnVariables) {
+            std::unique_ptr<MNNTrain::KVT> kv(new MNNTrain::KVT);
+            kv->key = bnIter.first;
+            kv->value = bnIter.second->name();
+            trainInfo->batchnormal.emplace_back(std::move(kv));
+        }
+        for (auto& iter : turnTrainable.mTrainInfo.trainables) {
+            std::unique_ptr<MNNTrain::KVT> kv(new MNNTrain::KVT);
+            kv->key = iter.first;
+            kv->value = iter.second;
+            trainInfo->trainables.emplace_back(std::move(kv));
+        }
+        for (auto& iter : turnTrainable.mTrainInfo.convolutionVariables) {
+            std::unique_ptr<MNNTrain::OpInfoT> kv(new MNNTrain::OpInfoT);
+            kv->op = iter.first;
+            kv->weight = iter.second.first;
+            kv->bias = iter.second.second;
+            trainInfo->convolutions.emplace_back(std::move(kv));
+        }
+        flatbuffers::FlatBufferBuilder builder;
+        builder.Finish(MNNTrain::TrainInfo::Pack(builder, trainInfo.get()));
+        std::ofstream _t(revertConfigFile.c_str());
+        auto s = flatbuffers::FlatBufferToString((const uint8_t*)builder.GetBufferPointer(), MNNTrain::TrainInfoTypeTable());
+        _t << s;
+    }
+    auto trainInfo = turnTrainable.mTrainInfo.bnVariables;
     if (configObject.HasMember("Shape")) {
         auto shapeArray = configObject["Shape"].GetObject();
         for (auto shapeIter = shapeArray.begin(); shapeIter != shapeArray.end(); shapeIter++) {
@@ -141,6 +228,10 @@ int main(int argc, const char* argv[]) {
     }
 
     VARP loss;
+    bool train = configObject.HasMember("Train");
+    if (!train) {
+        MNN_PRINT("Don't has member Train, generate grad model\n");
+    }
     bool hasLoss = configObject.HasMember("Loss");
     if (!hasLoss) {
         auto output      = outputVars.begin()->second;
@@ -184,207 +275,64 @@ int main(int argc, const char* argv[]) {
                 break;
             }
         }
+        if (nullptr == loss.get()) {
+            MNN_ERROR("Can't find loss op\n");
+            return 0;
+        }
     }
+    auto lossInfo = loss->getInfo();
     MNN_ASSERT(nullptr != loss);
     auto gradMap = OpGrad::grad(loss, parameters, stopBackPropOps);
+    if (gradMap.empty()) {
+        MNN_ERROR("Grad error, don't has grad\n");
+        return 0;
+    }
+    for (auto iter : gradMap) {
+        if (!iter.first->name().empty()) {
+            iter.second->setName(iter.first->name() + "::grad");
+        }
+    }
+    if (!train) {
+        std::vector<MNN::Express::VARP> gradVars = {loss};
+        for (auto iter : gradMap) {
+            iter.first.fix(VARP::INPUT);
+            gradVars.emplace_back(iter.second);
+        }
+        ParameterOptimizer::makeLoopModel(argv[2], gradVars, std::make_pair(std::vector<MNN::Express::VARP>{}, std::vector<MNN::Express::VARP>{}));
+        return 0;
+    }
     // Make Update
-    std::map<VARP, VARP> varUpdateMap;
-    auto learningRate = _Input();
-    learningRate->setName("LearningRate");
-    auto weightDecay = _Input();
-    weightDecay->setName("WeightDecay");
-
-    auto step = _Scalar<float>(1.0f);
-    step->setName("optimize_step");
-    step.fix(VARP::TRAINABLE);
-    auto stepPlus1 = step + _Scalar<float>(1.0f);
-    stepPlus1->setName("optimize_step+1");
-    varUpdateMap[step] = stepPlus1;
-
-    std::map<std::string, std::string> extraInputs;
-    extraInputs["LearningRate"] = "float";
-    extraInputs["WeightDecay"] = "float";
-    if (trainInfo["is_training_float"]->linkNumber() > 0) {
-        extraInputs["is_training"] = "int, 0 or 1";
-    }
-
+    std::shared_ptr<MNN::Train::ParameterOptimizer> optimizer;
     if (optimizerType == "SGD") {
-        auto momentum = _Input();
-        momentum->setName("Momentum");
-        extraInputs["Momentum"] = "float";
-
-        for (auto iter : gradMap) {
-            auto p = iter.first;
-            p.fix(VARP::TRAINABLE);
-            auto grad = iter.second;
-            grad->setName(p->name()+"_grad");
-
-            if (p->name().find("_BN_RunningMean_Weight") != string::npos) {
-                varUpdateMap[p] = trainInfo[p->name()];
-                continue; // not update running stats
-            }
-            if (p->name().find("_BN_RunningVariance_Weight") != string::npos) {
-                varUpdateMap[p] = trainInfo[p->name()];
-                continue; // not update running stats
-            }
-            if (p->name().find("_BN_Eps_Weight") != string::npos) {
-                continue; // not update eps
-            }
-
-            auto pInfo = p->getInfo();
-            auto pDims = pInfo->dim;
-
-            auto l2grad = weightDecay * p;
-            l2grad->setName(p->name() + "_l2grad");
-
-            VARP gradWithDecay = nullptr;
-            if (p->name().find("Weight") != string::npos) {
-                gradWithDecay = grad + l2grad;
-            } else {
-                gradWithDecay = grad;
-            }
-
-            VARP history = _Const(0.0f, pDims, pInfo->order);
-            history->setName(p->name() + "_momentum");
-            history.fix(VARP::TRAINABLE);
-
-            auto newHistory = gradWithDecay + momentum * history;
-            newHistory->setName("update_" + history->name());
-
-            auto finalGrad = learningRate * history;
-            finalGrad->setName(p->name() + "_final_grad");
-
-            auto updateValue = _Subtract(p, finalGrad);
-            updateValue->setName("update_" + p->name());
-            varUpdateMap[p] = updateValue;
-            varUpdateMap[history] = newHistory;
-        }
+        optimizer.reset(MNN::Train::ParameterOptimizer::createSGD(nullptr, 0.01f, 0.90f, 0.00f, MNN::Train::ParameterOptimizer::L1));
     } else if (optimizerType == "ADAM") {
-        auto beta1 = _Input();
-        beta1->setName("Beta1");
-        auto beta2 = _Input();
-        beta2->setName("Beta2");
-        auto eps = _Input();
-        eps->setName("Eps");
-
-        extraInputs["Beta1"] = "float";
-        extraInputs["Beta2"] = "float";
-        extraInputs["Eps"] = "float";
-
-        auto correction = _Sqrt(_Const(1.0f, {}, NCHW) - _Pow(beta2, step)) / (_Const(1.0f, {}, NCHW) - _Pow(beta1, step));
-        correction->setName("correction");
-        
-        for (auto iter : gradMap) {
-            auto p = iter.first;
-            p.fix(VARP::TRAINABLE);
-            auto grad = iter.second;
-            grad->setName(p->name()+"_grad");
-
-            if (p->name().find("_BN_RunningMean_Weight") != string::npos) {
-                varUpdateMap[p] = trainInfo[p->name()];
-                continue; // not update running stats
-            }
-            if (p->name().find("_BN_RunningVariance_Weight") != string::npos) {
-                varUpdateMap[p] = trainInfo[p->name()];
-                continue; // not update running stats
-            }
-            if (p->name().find("_BN_Eps_Weight") != string::npos) {
-                continue; // not update eps
-            }
-
-            auto pInfo = p->getInfo();
-            auto pDims = pInfo->dim;
-
-            auto l2grad = weightDecay * p;
-            l2grad->setName(p->name() + "_l2grad");
-
-            VARP gradWithDecay = nullptr;
-            if (p->name().find("Weight") != string::npos) {
-                gradWithDecay = grad + l2grad;
-            } else {
-                gradWithDecay = grad;
-            }
-        
-            VARP history1 = _Const(0.0f, pDims, pInfo->order);
-            history1->setName(p->name() + "_momentum1");
-            history1.fix(VARP::TRAINABLE);
-            auto newHistory1 = beta1 * history1 + (_Scalar(1.0f) - beta1) * gradWithDecay;
-            newHistory1->setName("update_" + history1->name());
-
-            VARP history2 = _Const(0.0f, pDims, pInfo->order);
-            history2->setName(p->name() + "_momentum2");
-            history2.fix(VARP::TRAINABLE);
-            auto newHistory2 = beta2 * history2 + (_Scalar(1.0f) - beta2) * _Square(gradWithDecay);
-            newHistory2->setName("update_" + history2->name());
-
-            auto finalGrad = learningRate * correction * (history1 / (_Sqrt(history2 + _Scalar<float>(1e-8)) + eps));
-            finalGrad->setName(p->name() + "_final_grad");
-
-            auto updateValue = _Subtract(p, finalGrad);
-            updateValue->setName("update_" + p->name());
-            varUpdateMap[p] = updateValue;
-            varUpdateMap[history1] = newHistory1;
-            varUpdateMap[history2] = newHistory2;
-        }
-    } else {
-        MNN_ERROR("error: don't support optimizer type: %s\n", optimizerType.c_str());
+        optimizer.reset(MNN::Train::ParameterOptimizer::createADAM(nullptr, 0.01f, 0.90f, 0.999f, 0.00f, 0.00005f, MNN::Train::ParameterOptimizer::L1));
     }
 
-    MNN_PRINT(">>>\nextra input tensors for %s:\n\n", optimizerType.c_str());
-    for (auto& input : extraInputs) {
-        MNN_PRINT("name: %s, \ttype: %s\n", input.first.c_str(), input.second.c_str());
-    }
-    MNN_PRINT("<<<\n");
-
-    std::unique_ptr<MNN::NetT> netStruct(new MNN::NetT);
-    std::vector<VARP> resultOutputs;
-    for (auto output : outputVars) {
-        resultOutputs.emplace_back(output.second);
-    }
-    resultOutputs.emplace_back(loss);
-    for (auto iter : varUpdateMap) {
-        resultOutputs.emplace_back(iter.second);
-    }
-    Variable::save(resultOutputs, ".grad.mnn");
-    Variable::save(resultOutputs, netStruct.get());
-    for (int i = 0; i < netStruct->oplists.size(); ++i) {
-        auto& op = netStruct->oplists[i];
-        for (auto iter : varUpdateMap) {
-            if (iter.second->name() == op->name) {
-                for (int j = 0; j < netStruct->oplists.size(); ++j) {
-                    auto& opSub = netStruct->oplists[j];
-                    if (opSub->name == iter.first->name()) {
-                        auto indexOri = op->outputIndexes;
-                        op->outputIndexes = opSub->outputIndexes;
-
-                        if ((opSub->name.find("_BN_RunningMean_Weight") != string::npos) || (opSub->name.find("_BN_RunningVariance_Weight") != string::npos)) {
-                            for (int k = 0; k < netStruct->oplists.size(); ++k) {
-                                auto& opSubSub = netStruct->oplists[k];
-                                if (opSubSub->inputIndexes.size() > 0) {
-                                    for (int kk = 0; kk < opSubSub->inputIndexes.size(); kk++) {
-                                        if (opSubSub->inputIndexes[kk] == indexOri[0]) {
-                                            opSubSub->inputIndexes[kk] = opSub->outputIndexes[0];
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+    auto learningRate = _Input({}, NCHW);
+    learningRate->setName("LearningRate");
+    std::vector<ParameterOptimizer::ParameterOptGrad> gradVars;
+    for (auto iter : gradMap) {
+        ParameterOptimizer::ParameterOptGrad gradVar;
+        gradVar.parameter = iter.first;
+        gradVar.parameterGrad = iter.second;
+        gradVar.learningRate = learningRate;
+        if (!lrNames.empty()) {
+            // Find lr Index
+            auto pName = iter.first->name();
+            for (int ii = 0; ii < weightNameGroups.size(); ii++) {
+                if (std::find(weightNameGroups[ii].begin(), weightNameGroups[ii].end(), pName) != weightNameGroups[ii].end()) {
+                    gradVar.learningRate = lrNames[ii];
+                    break;
                 }
             }
         }
+        gradVars.emplace_back(gradVar);
     }
-    netStruct->usage = MNN::Usage_TRAIN;
+    auto loopPair = optimizer->onMakeParameterUpdateGraphByGrad(gradVars);
 
-    {
-        flatbuffers::FlatBufferBuilder builder(1024);
-        auto offset = Net::Pack(builder, netStruct.get());
-        builder.Finish(offset);
-        // TODO, use FileWriter instead
-        FILE* f = fopen(argv[2], "wb");
-        fwrite(builder.GetBufferPointer(), 1, builder.GetSize(), f);
-        fclose(f);
-    }
-
+    std::unique_ptr<MNN::NetT> netStruct(new MNN::NetT);
+    std::vector<VARP> resultOutputs = {loss};
+    ParameterOptimizer::makeLoopModel(argv[2], resultOutputs, loopPair);
     return 0;
 }

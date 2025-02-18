@@ -9,7 +9,7 @@
 
 #include "OpGrad.hpp"
 using namespace std;
-using namespace MNN;
+namespace MNN {
 using namespace MNN::Express;
 
 class GridSampleGrad : public OpGrad {
@@ -17,13 +17,21 @@ public:
     virtual std::vector<Express::VARP> onGrad(Express::EXPRP expr,
                                               const std::vector<Express::VARP>& backwardOutput) override {
         auto op = expr->get();
+        const auto& inputs = expr->inputs();
+        std::vector<VARP> res(inputs.size());
+#ifndef GRIDSAMPLER_GRAD_DONT_CREATENEWOP
+        std::unique_ptr<MNN::OpT> gradOp(op->UnPack());
+        gradOp->name.clear();
+        gradOp->main.AsGridSample()->backward = true;
+        auto gradForParameterExpr = Expr::create(gradOp.get(), {backwardOutput[0], inputs[1], _Shape(inputs[0], NCHW)});
+        res[0] = Variable::create(gradForParameterExpr);
+        return res;
+#else
         auto param = op->main_as_GridSample();
         auto sampleMode = param->mode();
         auto padMode = param->paddingMode();
         auto alignCorners = param->alignCorners();
 
-        const auto& inputs = expr->inputs();
-        std::vector<VARP> res(inputs.size());
         auto input = inputs[0];
         auto grid = inputs[1];
         
@@ -185,13 +193,18 @@ public:
         }
 
         res[0] = _Convert(res[0], inputInfo->order);
-
         return res;
+#endif
     }
 };
 
-static const auto gRegister = []() {
+static void _create() {
     static GridSampleGrad _c;
     OpGrad::insert((int)OpType_GridSample, &_c);
-    return true;
-}();
+    OpGrad::insert((int)OpType_Texture, &_c);
+
+}
+
+REGISTER_GRAD(GridSampleGrad_cpp, _create);
+};
+
